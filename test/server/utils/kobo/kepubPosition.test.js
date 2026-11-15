@@ -7,7 +7,7 @@ const Path = require('path')
 const htmlparser2 = require('htmlparser2')
 const archiver = require('../../../../server/libs/archiver')
 const Logger = require('../../../../server/Logger')
-const { buildBookMap, locateBookmark, bookmarkFromProgress, findChapter, normalizeSource, cfiAt, parseCfi } = require('../../../../server/utils/kobo/kepubPosition')
+const { buildBookMap, locateBookmark, bookmarkFromProgress, cfiAt } = require('../../../../server/utils/kobo/kepubPosition')
 
 const CONTAINER = '<?xml version="1.0"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>'
 
@@ -152,18 +152,6 @@ describe('kepubPosition', () => {
       expect(encoded.chapters[1].spans.get('kobo.2.1')).to.equal(book.chapters[1].spans.get('kobo.2.1'))
     })
 
-    it('falls back to the first OPF without a container.xml', async () => {
-      const file = await writeZip([
-        ['mimetype', 'application/epub+zip'],
-        ['OEBPS/content.opf', OPF],
-        ['OEBPS/Text/ch1.xhtml', CHAPTER_ONE],
-        ['OEBPS/Text/ch 2.xhtml', CHAPTER_TWO]
-      ])
-      const fallback = await buildBookMap(file)
-      expect(fallback.chapters).to.have.length(2)
-      expect(fallback.length).to.equal(book.length)
-    })
-
     it('tolerates malformed and unreadable chapters', async () => {
       const opf =
         '<?xml version="1.0"?><package xmlns="http://www.idpf.org/2007/opf" version="3.0"><manifest>' +
@@ -196,8 +184,8 @@ describe('kepubPosition', () => {
     it('counts HTML entities as the characters they stand for and skips scripts and styles', async () => {
       const chapter = '<?xml version="1.0"?><html xmlns="http://www.w3.org/1999/xhtml"><head><style>p{}</style></head><body><p>A&nbsp;B &amp; C&#233;</p><script>var x = 1</script><p><![CDATA[D]]>E</p></body></html>'
       const opf = '<package><manifest><item id="c" href="c.xhtml"/></manifest><spine><itemref idref="c"/></spine></package>'
-      const entityBook = await buildBookMap(await writeZip([['content.opf', opf], ['c.xhtml', chapter]]))
-      expect(entityBook.chapters[0].source).to.equal('c.xhtml')
+      const entityBook = await buildBookMap(await writeZip([['META-INF/container.xml', CONTAINER], ['OEBPS/content.opf', opf], ['OEBPS/c.xhtml', chapter]]))
+      expect(entityBook.chapters[0].source).to.equal('OEBPS/c.xhtml')
       expect(entityBook.length).to.equal('A B & CéDE'.length)
     })
   })
@@ -210,6 +198,8 @@ describe('kepubPosition', () => {
       expect(spot.progress).to.equal(before / book.length)
       expect(spot.cfi).to.equal('epubcfi(/6/4[ch2]!/4/2/2/4/2/1:0)')
       expect(resolveCfi(spot.cfi, DOCUMENTS).startsWith('Then the')).to.equal(true)
+      // A source relative to the OPF finds the same chapter
+      expect(locateBookmark(book, { Location: { Source: 'Text/ch 2.xhtml', Type: 'KoboSpan', Value: 'kobo.2.1' } })).to.deep.equal(spot)
     })
 
     it('resolves every span back to its own text', () => {
@@ -265,45 +255,6 @@ describe('kepubPosition', () => {
       expect(spot.method).to.equal('span')
       expect(spot.cfi).to.equal('epubcfi(/6/4[ch2]!/4/4/1:0)')
       expect(resolveCfi(spot.cfi, [CHAPTER_ONE, CHAPTER_TWO_PLAIN]).startsWith('Then the')).to.equal(true)
-    })
-  })
-
-  describe('findChapter / normalizeSource', () => {
-    it('matches sources as zip paths', () => {
-      expect(normalizeSource('Text/ch%202.xhtml#frag', 'OEBPS')).to.equal('OEBPS/Text/ch 2.xhtml')
-      expect(normalizeSource('/OEBPS/Text/ch1.xhtml')).to.equal('OEBPS/Text/ch1.xhtml')
-      expect(normalizeSource('bad%zzname')).to.equal('bad%zzname')
-      expect(normalizeSource('')).to.equal(null)
-      expect(findChapter(book, 'Text/ch1.xhtml').source).to.equal('OEBPS/Text/ch1.xhtml')
-      expect(findChapter(book, 'OEBPS/Text/ch%202.xhtml').idref).to.equal('ch2')
-      expect(findChapter(book, 'root/OEBPS/Text/ch1.xhtml').idref).to.equal('ch1')
-      expect(findChapter(book, 'ch3.xhtml')).to.equal(null)
-      expect(findChapter(book, null)).to.equal(null)
-    })
-  })
-
-  describe('parseCfi', () => {
-    it('parses spine steps with and without an idref', () => {
-      expect(parseCfi('epubcfi(/6/4[ch2]!/4/2/2/4/2/1:0)')).to.deep.equal({ spineStep: 4, idref: 'ch2', steps: [4, 2, 2, 4, 2, 1], offset: 0 })
-      expect(parseCfi('epubcfi(/6/4!/4/2/1:7)')).to.deep.equal({ spineStep: 4, idref: null, steps: [4, 2, 1], offset: 7 })
-    })
-
-    it('parses a range CFI to its start', () => {
-      expect(parseCfi('epubcfi(/6/4!/4/2,/1:0,/1:5)')).to.deep.equal({ spineStep: 4, idref: null, steps: [4, 2, 1], offset: 0 })
-      expect(parseCfi('epubcfi(/6/4[ch2]!/4/2/1,:3,:9)')).to.deep.equal({ spineStep: 4, idref: 'ch2', steps: [4, 2, 1], offset: 3 })
-    })
-
-    it('tolerates element assertions, text assertions and side bias', () => {
-      expect(parseCfi('epubcfi(/6/4[ch,2]!/4[body01]/2[book-columns]/1:2[Mor,ning;s=b])')).to.deep.equal({ spineStep: 4, idref: 'ch,2', steps: [4, 2, 1], offset: 2 })
-      expect(parseCfi('epubcfi(/6/4[a^]b]!/4)')).to.deep.equal({ spineStep: 4, idref: 'a]b', steps: [4], offset: 0 })
-    })
-
-    it('rejects what is not a CFI', () => {
-      expect(parseCfi('not a cfi')).to.equal(null)
-      expect(parseCfi('epubcfi()')).to.equal(null)
-      expect(parseCfi('epubcfi(/6/x!/4)')).to.equal(null)
-      expect(parseCfi('epubcfi(/6/4!/4,/1:0)')).to.equal(null)
-      expect(parseCfi(null)).to.equal(null)
     })
   })
 

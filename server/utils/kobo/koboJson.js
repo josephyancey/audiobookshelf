@@ -1,12 +1,10 @@
-const crypto = require('crypto')
+const uuid = require('uuid')
 
 /**
  * Builders for the JSON a Kobo expects, field for field as Calibre-Web sends it
- * (docs/kobo-sync/calibre-web-reference.md §5).
  */
 
 const DEFAULT_CATEGORY = '00000000-0000-0000-0000-000000000001'
-const DNS_NAMESPACE = '6ba7b810-9dad-11d1-80b4-00c04fd430c8'
 
 /**
  * Kobo timestamps have no fractional seconds: 2026-11-14T22:40:16Z
@@ -19,22 +17,6 @@ function koboTimestamp(value, fallback = Date.now()) {
   let date = value instanceof Date ? value : value !== null && value !== undefined && value !== '' ? new Date(value) : null
   if (!date || isNaN(date.valueOf())) date = new Date(fallback)
   return date.toISOString().replace(/\.\d{3}Z$/, 'Z')
-}
-
-/**
- * RFC 4122 version 3 UUID, as Python's uuid3(NAMESPACE_DNS, name) builds Calibre-Web's series ids
- *
- * @param {string} name
- * @param {string} [namespace]
- * @returns {string}
- */
-function uuidV3(name, namespace = DNS_NAMESPACE) {
-  const namespaceBytes = Buffer.from(namespace.replace(/-/g, ''), 'hex')
-  const hash = crypto.createHash('md5').update(namespaceBytes).update(Buffer.from(String(name), 'utf8')).digest()
-  hash[6] = (hash[6] & 0x0f) | 0x30
-  hash[8] = (hash[8] & 0x3f) | 0x80
-  const hex = hash.toString('hex')
-  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`
 }
 
 let languageNameMap = null
@@ -98,7 +80,8 @@ function buildSeries(libraryItem) {
     Name: series.name,
     Number: number,
     NumberFloat: number,
-    Id: uuidV3(series.name)
+    // Same id as Calibre-Web: Python uuid3(NAMESPACE_DNS, name)
+    Id: uuid.v3(series.name, uuid.v3.DNS)
   }
 }
 
@@ -123,7 +106,7 @@ function buildBookEntitlement(libraryItem, { isRemoved }) {
   return {
     Accessibility: 'Full',
     ActivePeriod: { From: koboTimestamp(Date.now()) },
-    Created: koboTimestamp(libraryItem.addedAt || libraryItem.createdAt),
+    Created: koboTimestamp(libraryItem.createdAt),
     CrossRevisionId: id,
     Id: id,
     IsRemoved: !!isRemoved,
@@ -143,23 +126,8 @@ function buildBookEntitlement(libraryItem, { isRemoved }) {
  * @returns {Object}
  */
 function buildRemovedEntitlement(libraryItemId) {
-  const now = koboTimestamp(Date.now())
-  return {
-    BookEntitlement: {
-      Accessibility: 'Full',
-      ActivePeriod: { From: now },
-      Created: now,
-      CrossRevisionId: libraryItemId,
-      Id: libraryItemId,
-      IsRemoved: true,
-      IsHiddenFromArchive: false,
-      IsLocked: false,
-      LastModified: now,
-      OriginCategory: 'Imported',
-      RevisionId: libraryItemId,
-      Status: 'Active'
-    }
-  }
+  const now = new Date()
+  return { BookEntitlement: buildBookEntitlement({ id: libraryItemId, createdAt: now, updatedAt: now }, { isRemoved: true }) }
 }
 
 /**
@@ -245,9 +213,7 @@ function buildDeletedTag(collectionId) {
 }
 
 module.exports = {
-  DEFAULT_CATEGORY,
   koboTimestamp,
-  uuidV3,
   toIsoLanguage,
   buildBookEntitlement,
   buildRemovedEntitlement,

@@ -20,12 +20,9 @@
  */
 
 const Path = require('path')
-const { TextDecoder } = require('util')
 const htmlparser2 = require('htmlparser2')
 const StreamZip = require('../../libs/nodeStreamZip')
 const Logger = require('../../Logger')
-
-const KOBO_SPAN = 'KoboSpan'
 
 /**
  * @typedef Piece
@@ -76,19 +73,17 @@ const KOBO_SPAN = 'KoboSpan'
 //
 
 /**
- * Percent-decode like Python's `unquote`: invalid sequences are left as they are.
+ * Percent-decode a zip path, leaving it as it is when it is not valid
  *
  * @param {string} value
  * @returns {string}
  */
 function unquote(value) {
-  return value.replace(/(?:%[0-9a-fA-F]{2})+/g, (seq) => {
-    try {
-      return decodeURIComponent(seq)
-    } catch {
-      return seq
-    }
-  })
+  try {
+    return decodeURIComponent(value)
+  } catch {
+    return value
+  }
 }
 
 /**
@@ -158,27 +153,6 @@ function isElement(node) {
 }
 
 /**
- * Decode bytes the way an XML parser would: BOM, then the XML declaration, then UTF-8.
- *
- * @param {Buffer} buffer
- * @returns {string}
- */
-function decodeXml(buffer) {
-  let encoding = 'utf-8'
-  if (buffer[0] === 0xff && buffer[1] === 0xfe) encoding = 'utf-16le'
-  else if (buffer[0] === 0xfe && buffer[1] === 0xff) encoding = 'utf-16be'
-  else {
-    const declared = /^\s*<\?xml[^>]*encoding\s*=\s*["']([^"']+)["']/.exec(buffer.subarray(0, 200).toString('latin1'))
-    if (declared) encoding = declared[1].toLowerCase()
-  }
-  try {
-    return new TextDecoder(encoding).decode(buffer)
-  } catch {
-    return new TextDecoder('utf-8').decode(buffer)
-  }
-}
-
-/**
  * Decode entities in a raw text node. Browsers (and so epub.js and the Kobo reader) know the
  * HTML named entities in XHTML (`&nbsp;` is one character), which an XML parser does not.
  * The text has no markup left in it, so a tiny HTML-mode parse decodes it safely.
@@ -244,7 +218,7 @@ function walk(chapter, node, path, cursor) {
  * @param {Chapter} chapter
  */
 function mapChapter(data, chapter) {
-  const doc = htmlparser2.parseDocument(decodeXml(data), { xmlMode: true, decodeEntities: false })
+  const doc = htmlparser2.parseDocument(data.toString('utf8'), { xmlMode: true, decodeEntities: false })
   const root = (doc.children || []).find(isElement)
   if (!root) return
   const elements = (root.children || []).filter(isElement)
@@ -278,23 +252,6 @@ function parseSpine(opfText) {
 }
 
 /**
- * @param {Set<string>} names
- * @param {(name: string) => Promise<Buffer>} read
- * @returns {Promise<string|null>}
- */
-async function findOpfPath(names, read) {
-  if (names.has('META-INF/container.xml')) {
-    try {
-      const match = /full-path\s*=\s*"([^"]+)"/.exec((await read('META-INF/container.xml')).toString('utf8'))
-      if (match) return match[1]
-    } catch (error) {
-      Logger.warn(`[kepubPosition] Unreadable container.xml: ${error.message}`)
-    }
-  }
-  return [...names].find((name) => name.toLowerCase().endsWith('.opf')) || null
-}
-
-/**
  * Read an epub or kepub into its chapters, text runs and KoboSpans.
  * One unreadable or malformed chapter becomes a zero-length chapter; a file that is not a
  * zip rejects (so the caller does not cache a transient failure); a zip without an OPF
@@ -310,13 +267,14 @@ async function buildBookMap(ebookPath) {
   try {
     const names = new Set(Object.keys(await zip.entries()))
     const read = (name) => zip.entryData(name)
-    const opfPath = await findOpfPath(names, read)
+    const container = names.has('META-INF/container.xml') ? (await read('META-INF/container.xml')).toString('utf8') : ''
+    const opfPath = /full-path\s*=\s*"([^"]+)"/.exec(container)?.[1]
     if (!opfPath || !names.has(opfPath)) {
       Logger.warn(`[kepubPosition] No OPF in "${ebookPath}"`)
       return bookMap
     }
     const opfDir = Path.posix.dirname(opfPath) === '.' ? '' : Path.posix.dirname(opfPath)
-    const spine = parseSpine(decodeXml(await read(opfPath)))
+    const spine = parseSpine((await read(opfPath)).toString('utf8'))
 
     let cursor = 0
     for (const { idref, href, index: spineIndex } of spine) {
@@ -430,7 +388,7 @@ function locateBookmark(bookMap, currentBookmark, options = {}) {
     if (chapter) {
       let offset = null
       let method = null
-      if (location.Type === KOBO_SPAN && chapter.spans.has(location.Value)) {
+      if (location.Type === 'KoboSpan' && chapter.spans.has(location.Value)) {
         offset = chapter.spans.get(location.Value)
         method = 'span'
       } else {
@@ -453,115 +411,27 @@ function locateBookmark(bookMap, currentBookmark, options = {}) {
 }
 
 //
-// CFI parsing
+// ABS → Kobo
 //
 
 /**
- * Parse an EPUB CFI into its spine step, content steps and character offset. Range CFIs
- * (`epubcfi(parent,start,end)`) resolve to their start. Assertions, side bias, temporal and
- * spatial offsets are tolerated and ignored (except the spine `[idref]`).
+ * Parse the CFIs epub.js stores, `epubcfi(/6/N[idref]!/4/2[id]/1:offset)`, or the start of a
+ * range CFI `epubcfi(/6/N!/4/2,/1:0,/1:9)`
  *
  * @param {string} cfi
  * @returns {ParsedCfi|null}
  */
 function parseCfi(cfi) {
-  const match = /^\s*epubcfi\(([\s\S]*)\)\s*$/.exec(String(cfi || ''))
+  const match = /^epubcfi\(\/6\/(\d+)(?:\[([^\]]*)\])?!([^,)]*)(?:,([^,)]*),[^)]*)?\)$/.exec(cfi)
   if (!match) return null
-  const body = match[1]
-
-  // Split a range on top-level commas (commas inside [...] are assertion text)
-  const parts = []
-  let current = ''
-  let depth = 0
-  for (let i = 0; i < body.length; i++) {
-    const c = body[i]
-    if (c === '^' && i + 1 < body.length) {
-      current += c + body[++i]
-      continue
-    }
-    if (c === '[') depth++
-    else if (c === ']') depth = Math.max(0, depth - 1)
-    if (c === ',' && depth === 0) {
-      parts.push(current)
-      current = ''
-    } else current += c
+  const path = match[3] + (match[4] || '')
+  const offset = /:(\d+)/.exec(path)
+  return {
+    spineStep: Number(match[1]),
+    idref: match[2] || null,
+    steps: [...path.replace(/:.*$/, '').matchAll(/\/(\d+)/g)].map((step) => Number(step[1])),
+    offset: offset ? Number(offset[1]) : 0
   }
-  parts.push(current)
-  if (parts.length !== 1 && parts.length !== 3) return null
-  const path = parts.length === 3 ? parts[0] + parts[1] : parts[0]
-
-  /** @type {{ index: number, assertion: string|null }[][]} */
-  const segments = [[]]
-  let offset = null
-  let i = 0
-  const readAssertion = () => {
-    if (path[i] !== '[') return null
-    let text = ''
-    i++
-    while (i < path.length && path[i] !== ']') {
-      if (path[i] === '^' && i + 1 < path.length) i++
-      text += path[i++]
-    }
-    if (path[i] !== ']') throw new Error('unterminated assertion')
-    i++
-    return text
-  }
-  try {
-    while (i < path.length) {
-      const c = path[i]
-      if (c === '/') {
-        const digits = /^\d+/.exec(path.slice(i + 1))
-        if (!digits) return null
-        i += 1 + digits[0].length
-        const assertion = readAssertion()
-        if (offset !== null) return null
-        segments[segments.length - 1].push({ index: Number(digits[0]), assertion })
-      } else if (c === '!') {
-        i++
-        segments.push([])
-      } else if (c === ':') {
-        const digits = /^\d+/.exec(path.slice(i + 1))
-        if (!digits) return null
-        i += 1 + digits[0].length
-        offset = Number(digits[0])
-        readAssertion()
-      } else if (c === '~' || c === '@') {
-        const skip = /^[~@][\d.:]+/.exec(path.slice(i))
-        if (!skip) return null
-        i += skip[0].length
-        readAssertion()
-      } else if (/\s/.test(c)) {
-        i++
-      } else return null
-    }
-  } catch {
-    return null
-  }
-
-  let spineStep = null
-  let idref = null
-  let steps = []
-  if (segments.length >= 2) {
-    const pkg = segments[0]
-    if (pkg.length) {
-      spineStep = pkg[pkg.length - 1].index
-      idref = pkg[pkg.length - 1].assertion
-    }
-    steps = segments[1].map((step) => step.index)
-  } else {
-    const flat = segments[0]
-    if (flat.length >= 2 && flat[0].index === 6) {
-      spineStep = flat[1].index
-      idref = flat[1].assertion
-      steps = flat.slice(2).map((step) => step.index)
-    } else if (flat.length) {
-      spineStep = flat[0].index
-      idref = flat[0].assertion
-      steps = flat.slice(1).map((step) => step.index)
-    }
-  }
-  if (spineStep === null) return null
-  return { spineStep, idref: idref || null, steps, offset: offset || 0 }
 }
 
 /**
@@ -667,7 +537,7 @@ function bookmarkFromProgress(bookMap, { ebookLocation, ebookProgress } = {}, op
   let progress = fraction
 
   if (bookMap?.length) {
-    const parsed = typeof ebookLocation === 'string' && ebookLocation.startsWith('epubcfi(') ? parseCfi(ebookLocation) : null
+    const parsed = typeof ebookLocation === 'string' ? parseCfi(ebookLocation) : null
     const cfiMap = options.cfiBookMap || bookMap
     const cfiChapter = parsed ? chapterForCfi(cfiMap, parsed) : null
     if (cfiChapter) {
@@ -694,19 +564,15 @@ function bookmarkFromProgress(bookMap, { ebookLocation, ebookProgress } = {}, op
 
   const bookmark = {}
   const spanId = spanAt(chapter, offset)
-  if (spanId !== null) bookmark.Location = { Source: chapter.source, Type: KOBO_SPAN, Value: spanId }
+  if (spanId !== null) bookmark.Location = { Source: chapter.source, Type: 'KoboSpan', Value: spanId }
   bookmark.ProgressPercent = toPercent(progress)
   bookmark.ContentSourceProgressPercent = chapter.length ? toPercent(offset / chapter.length) : 0
   return bookmark
 }
 
 module.exports = {
-  KOBO_SPAN,
   buildBookMap,
   locateBookmark,
   bookmarkFromProgress,
-  findChapter,
-  normalizeSource,
-  cfiAt,
-  parseCfi
+  cfiAt
 }

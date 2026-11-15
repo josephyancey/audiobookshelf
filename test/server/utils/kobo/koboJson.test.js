@@ -2,7 +2,7 @@ const { expect } = require('chai')
 const sinon = require('sinon')
 
 const Logger = require('../../../../server/Logger')
-const { koboTimestamp, uuidV3, toIsoLanguage, buildBookMetadata } = require('../../../../server/utils/kobo/koboJson')
+const { koboTimestamp, toIsoLanguage, buildBookMetadata } = require('../../../../server/utils/kobo/koboJson')
 const { parseSyncToken, buildSyncToken } = require('../../../../server/utils/kobo/syncToken')
 
 describe('koboJson', () => {
@@ -10,11 +10,6 @@ describe('koboJson', () => {
     expect(koboTimestamp(new Date('2026-11-14T10:20:30.456Z'))).to.equal('2026-11-14T10:20:30Z')
     expect(koboTimestamp('not a date', Date.UTC(2020, 0, 1))).to.equal('2020-01-01T00:00:00Z')
     expect(koboTimestamp(null, Date.UTC(2020, 0, 1))).to.equal('2020-01-01T00:00:00Z')
-  })
-
-  it('builds series ids the way Python uuid3(NAMESPACE_DNS, name) does', () => {
-    // python: str(uuid.uuid3(uuid.NAMESPACE_DNS, 'python.org'))
-    expect(uuidV3('python.org')).to.equal('6fa459ea-ee8a-3ca4-894e-db77e160355e')
   })
 
   it('maps free text languages to two letter codes', () => {
@@ -43,6 +38,9 @@ describe('koboJson', () => {
     expect(metadata.Contributors).to.deep.equal(['James S. A. Corey', 'Second Author'])
     expect(metadata.ContributorRoles).to.deep.equal([{ Name: 'James S. A. Corey' }, { Name: 'Second Author' }])
     expect(metadata.Series).to.deep.include({ Name: 'The Expanse', Number: 1.5, NumberFloat: 1.5 })
+    // Calibre-Web's series id, python: str(uuid.uuid3(uuid.NAMESPACE_DNS, 'python.org'))
+    libraryItem.media.series[0].name = 'python.org'
+    expect(buildBookMetadata(libraryItem, { downloadUrls: [], coverImageId: 'cover' }).Series.Id).to.equal('6fa459ea-ee8a-3ca4-894e-db77e160355e')
     expect(metadata.PublicationDate).to.equal('2011-01-01T00:00:00Z')
     expect(metadata.Publisher).to.deep.equal({ Imprint: '', Name: 'Orbit' })
   })

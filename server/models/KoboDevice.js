@@ -23,10 +23,6 @@ class KoboDevice extends Model {
     this.collectionIds
     /** @type {Date} */
     this.lastSyncAt
-    /** @type {string} */
-    this.lastIp
-    /** @type {string} */
-    this.lastUserAgent
     /** @type {UUIDV4} */
     this.userId
     /** @type {Date} */
@@ -124,9 +120,7 @@ class KoboDevice extends Model {
           defaultValue: false
         },
         collectionIds: DataTypes.JSON,
-        lastSyncAt: DataTypes.DATE,
-        lastIp: DataTypes.STRING,
-        lastUserAgent: DataTypes.STRING
+        lastSyncAt: DataTypes.DATE
       },
       {
         sequelize,

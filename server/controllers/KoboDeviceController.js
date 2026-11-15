@@ -16,43 +16,43 @@ const htmlSanitizer = require('../utils/htmlSanitizer')
  * @typedef {RequestWithUser & RequestEntityObject} KoboDeviceControllerRequest
  */
 
+/**
+ * Validate the editable fields of a device
+ *
+ * @param {Object} body
+ * @param {boolean} isCreate
+ * @returns {{ values?: Object, error?: string }}
+ */
+function parseDeviceBody(body, isCreate) {
+  const values = {}
+  if (!body || typeof body !== 'object') return { error: 'Invalid request body' }
+
+  if (body.name !== undefined || isCreate) {
+    const name = htmlSanitizer.stripAllTags(String(body.name || '')).trim()
+    if (!name) return { error: 'Device name is required' }
+    values.name = name.slice(0, 100)
+  }
+  if (body.libraryIds !== undefined) {
+    if (body.libraryIds !== null && (!Array.isArray(body.libraryIds) || body.libraryIds.some((id) => typeof id !== 'string'))) {
+      return { error: 'libraryIds must be an array of strings or null' }
+    }
+    values.libraryIds = body.libraryIds?.length ? [...new Set(body.libraryIds)] : null
+  }
+  if (body.onlyCollections !== undefined) {
+    if (typeof body.onlyCollections !== 'boolean') return { error: 'onlyCollections must be a boolean' }
+    values.onlyCollections = body.onlyCollections
+  }
+  if (body.collectionIds !== undefined) {
+    if (!Array.isArray(body.collectionIds) || body.collectionIds.some((id) => typeof id !== 'string')) {
+      return { error: 'collectionIds must be an array of strings' }
+    }
+    values.collectionIds = [...new Set(body.collectionIds)]
+  }
+  return { values }
+}
+
 class KoboDeviceController {
   constructor() {}
-
-  /**
-   * Validate the editable fields of a device
-   *
-   * @param {Object} body
-   * @param {boolean} isCreate
-   * @returns {{ values?: Object, error?: string }}
-   */
-  parseDeviceBody(body, isCreate) {
-    const values = {}
-    if (!body || typeof body !== 'object') return { error: 'Invalid request body' }
-
-    if (body.name !== undefined || isCreate) {
-      const name = htmlSanitizer.stripAllTags(String(body.name || '')).trim()
-      if (!name) return { error: 'Device name is required' }
-      values.name = name.slice(0, 100)
-    }
-    if (body.libraryIds !== undefined) {
-      if (body.libraryIds !== null && (!Array.isArray(body.libraryIds) || body.libraryIds.some((id) => typeof id !== 'string'))) {
-        return { error: 'libraryIds must be an array of strings or null' }
-      }
-      values.libraryIds = body.libraryIds?.length ? [...new Set(body.libraryIds)] : null
-    }
-    if (body.onlyCollections !== undefined) {
-      if (typeof body.onlyCollections !== 'boolean') return { error: 'onlyCollections must be a boolean' }
-      values.onlyCollections = body.onlyCollections
-    }
-    if (body.collectionIds !== undefined) {
-      if (!Array.isArray(body.collectionIds) || body.collectionIds.some((id) => typeof id !== 'string')) {
-        return { error: 'collectionIds must be an array of strings' }
-      }
-      values.collectionIds = [...new Set(body.collectionIds)]
-    }
-    return { values }
-  }
 
   /**
    * GET: /api/me/kobo-devices
@@ -73,7 +73,7 @@ class KoboDeviceController {
    * @param {Response} res
    */
   async create(req, res) {
-    const { values, error } = this.parseDeviceBody(req.body, true)
+    const { values, error } = parseDeviceBody(req.body, true)
     if (error) return res.status(400).send(error)
 
     const token = Database.koboDeviceModel.generateToken()
@@ -93,7 +93,7 @@ class KoboDeviceController {
    * @param {Response} res
    */
   async update(req, res) {
-    const { values, error } = this.parseDeviceBody(req.body, false)
+    const { values, error } = parseDeviceBody(req.body, false)
     if (error) return res.status(400).send(error)
     await req.koboDevice.update(values)
     res.json({ device: req.koboDevice.toJSON() })

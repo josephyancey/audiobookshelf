@@ -5,7 +5,6 @@ const Database = require('../Database')
 const LibraryScanner = require('../scanner/LibraryScanner')
 
 const ShareManager = require('./ShareManager')
-const KepubManager = require('./KepubManager')
 
 class CronManager {
   constructor(podcastManager, playbackSessionManager) {
@@ -38,7 +37,6 @@ class CronManager {
    * Closes open playback sessions that have not been updated in 36 hours
    * Cleans up expired auth sessions
    * Deactivates expired api keys
-   * Removes stale kepub conversion cache files
    * TODO: Clients should re-open the session if it is closed so that stale sessions can be closed sooner
    */
   initOpenSessionCleanupCron() {
@@ -48,7 +46,6 @@ class CronManager {
       await this.playbackSessionManager.closeStaleOpenSessions()
       await Database.cleanupExpiredSessions()
       await Database.deactivateExpiredApiKeys()
-      await KepubManager.cleanup()
     })
   }
 

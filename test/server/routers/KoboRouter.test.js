@@ -14,7 +14,10 @@ const SocketAuthority = require('../../../server/SocketAuthority')
 const ServerSettings = require('../../../server/objects/settings/ServerSettings')
 const KoboRouter = require('../../../server/routers/KoboRouter')
 const KoboController = require('../../../server/controllers/KoboController')
+const CacheManager = require('../../../server/managers/CacheManager')
 const KepubManager = require('../../../server/managers/KepubManager')
+const KoboReadingStateManager = require('../../../server/managers/KoboReadingStateManager')
+const RateLimiterFactory = require('../../../server/utils/rateLimiterFactory')
 const KoboStoreProxy = require('../../../server/managers/KoboStoreProxy')
 const { parseSyncToken } = require('../../../server/utils/kobo/syncToken')
 
@@ -29,9 +32,12 @@ const CHAPTER_TWO =
   '<p><span class="koboSpan" id="kobo.1.1">Morning came. </span><span class="koboSpan" id="kobo.1.2">Nobody spoke.</span></p>' +
   '<p><span class="koboSpan" id="kobo.2.1">Then the engines started.</span></p></div></div></body></html>'
 
+const FIXED_LAYOUT_OPF = OPF.replace('<metadata/>', '<metadata><meta property="rendition:layout">pre-paginated</meta></metadata>')
+const stripSpans = (html) => html.replace(/<\/?span[^>]*>/g, '')
+
 const tempDir = fs.mkdtempSync(Path.join(os.tmpdir(), 'kobo-router-'))
 
-function writeKepub(name) {
+function writeKepub(name, { opf = OPF, chapters = [CHAPTER_ONE, CHAPTER_TWO] } = {}) {
   const file = Path.join(tempDir, name)
   return new Promise((resolve, reject) => {
     const output = fs.createWriteStream(file)
@@ -41,9 +47,9 @@ function writeKepub(name) {
     archive.pipe(output)
     archive.append('application/epub+zip', { name: 'mimetype', store: true })
     archive.append(CONTAINER, { name: 'META-INF/container.xml' })
-    archive.append(OPF, { name: 'OEBPS/content.opf' })
-    archive.append(CHAPTER_ONE, { name: 'OEBPS/ch1.xhtml' })
-    archive.append(CHAPTER_TWO, { name: 'OEBPS/ch2.xhtml' })
+    archive.append(opf, { name: 'OEBPS/content.opf' })
+    archive.append(chapters[0], { name: 'OEBPS/ch1.xhtml' })
+    archive.append(chapters[1], { name: 'OEBPS/ch2.xhtml' })
     archive.finalize()
   })
 }
@@ -57,6 +63,9 @@ describe('KoboRouter', () => {
   let token
   let device
   let ebookPath
+  let kepubPath
+  let fixedLayoutPath
+  let plainEpubPath
 
   /** A fake Kobo: remembers the last sync token like the device does */
   class Kobo {
@@ -107,8 +116,8 @@ describe('KoboRouter', () => {
       language: 'English',
       ebookFile: {
         ino: `${title}-ino`,
-        ebookFormat: extra.ebookFormat || 'epub',
-        metadata: { filename: Path.basename(ebookPath), ext: '.epub', path: extra.path || ebookPath, size: 1234, mtimeMs: 1 }
+        ebookFormat: 'epub',
+        metadata: { filename: Path.basename(extra.path || ebookPath), ext: '.epub', path: extra.path || ebookPath, size: 1234, mtimeMs: 1 }
       }
     })
     const libraryItem = await Database.libraryItemModel.create({ libraryFiles: [], mediaId: book.id, mediaType: 'book', libraryId: extra.libraryId || library.id, libraryFolderId: libraryFolder.id, title })
@@ -117,10 +126,17 @@ describe('KoboRouter', () => {
 
   before(async () => {
     ebookPath = await writeKepub('book.epub')
+    kepubPath = await writeKepub('book.kepub.epub')
+    fixedLayoutPath = await writeKepub('fixed.epub', { opf: FIXED_LAYOUT_OPF })
+    plainEpubPath = await writeKepub('plain.epub', { chapters: [stripSpans(CHAPTER_ONE), stripSpans(CHAPTER_TWO)] })
     global.MetadataPath = tempDir
+    CacheManager.KepubCachePath = Path.join(tempDir, 'kepub')
+    process.env.RATE_LIMIT_AUTH_MAX = '3'
   })
 
   after(() => {
+    delete process.env.RATE_LIMIT_AUTH_MAX
+    RateLimiterFactory.koboRateLimiter = null
     fs.rmSync(tempDir, { recursive: true, force: true })
   })
 
@@ -159,6 +175,7 @@ describe('KoboRouter', () => {
       next()
     })
     app.use(KoboController.readingServicesStub.bind(KoboController))
+    RateLimiterFactory.koboRateLimiter = null
     app.use('/kobo/:token', new KoboRouter().router)
     await new Promise((resolve) => {
       server = app.listen(0, '127.0.0.1', resolve)
@@ -176,6 +193,18 @@ describe('KoboRouter', () => {
     it('refuses an unknown token with 401', async () => {
       const res = await new Kobo('0'.repeat(32)).request('get', '/v1/library/sync')
       expect(res.status).to.equal(401)
+    })
+
+    it('rate limits failed tokens only, not store 401s forwarded for a valid device', async () => {
+      Database.serverSettings.koboStoreProxy = true
+      sinon.stub(KoboStoreProxy, 'request').resolves({ status: 401, headers: {}, data: '' })
+      const kobo = new Kobo(token)
+      for (let i = 0; i < 5; i++) expect((await kobo.request('post', '/v1/user/wishlist')).status).to.equal(401)
+      expect((await kobo.request('get', '/v1/library/sync')).status).to.equal(200)
+
+      const stranger = new Kobo('0'.repeat(32))
+      for (let i = 0; i < 3; i++) expect((await stranger.request('get', '/v1/library/sync')).status).to.equal(401)
+      expect((await stranger.request('get', '/v1/library/sync')).status).to.equal(429)
     })
 
     it('refuses everything while Kobo sync is disabled', async () => {
@@ -341,6 +370,27 @@ describe('KoboRouter', () => {
       expect(urls[0]).to.include({ Format: 'KEPUB', Url: `${baseUrl}/kobo/${token}/download/${item.id}/kepub` })
     })
 
+    it('sends a fixed-layout epub once as EPUB3FL even when kepubify is available', async () => {
+      KepubManager.isAvailable.returns(true)
+      const item = await addBook('Comic', { path: fixedLayoutPath })
+      const kobo = new Kobo(token)
+      const first = await kobo.sync()
+      expect(entitlementIds(first.body, 'NewEntitlement')).to.deep.equal([item.id])
+      expect(first.body[0].NewEntitlement.BookMetadata.DownloadUrls.map((url) => url.Format)).to.deep.equal(['EPUB3FL'])
+      expect((await kobo.sync()).body).to.deep.equal([])
+    })
+
+    it('neither removes nor resends a book while it is marked missing', async () => {
+      const item = await addBook('Unmounted')
+      const kobo = new Kobo(token)
+      await kobo.syncAll()
+      await kobo.sync()
+      await item.update({ isMissing: true }, { silent: true })
+      expect((await kobo.sync()).body).to.deep.equal([])
+      await item.update({ isMissing: false }, { silent: true })
+      expect((await kobo.sync()).body).to.deep.equal([])
+    })
+
     it('starts fresh on an unreadable sync token and on a store token', async () => {
       await addBook('Fresh')
       const kobo = new Kobo(token)
@@ -353,7 +403,7 @@ describe('KoboRouter', () => {
   describe('reading state', () => {
     let item
     beforeEach(async () => {
-      item = await addBook('Reading', { ebookFormat: 'kepub' })
+      item = await addBook('Reading', { path: kepubPath })
     })
 
     async function getProgress() {
@@ -389,6 +439,20 @@ describe('KoboRouter', () => {
       expect(get.data[0].CurrentBookmark.Location.Value).to.equal('kobo.2.1')
     })
 
+    it('converts the kepub for a KoboSpan bookmark when it is not cached', async () => {
+      const plainItem = await addBook('Not Converted Yet', { path: plainEpubPath })
+      const getKepubPath = sinon.stub(KepubManager, 'getKepubPath').resolves(kepubPath)
+      const put = await new Kobo(token).request('put', `/v1/library/${plainItem.id}/state`, {
+        ReadingStates: [{ CurrentBookmark: { ProgressPercent: 50, Location: { Source: 'OEBPS/ch2.xhtml', Type: 'KoboSpan', Value: 'kobo.2.1' } } }]
+      })
+      expect(put.status).to.equal(200)
+      expect(getKepubPath.calledOnce).to.equal(true)
+      const progress = await Database.mediaProgressModel.findOne({ where: { userId: user.id, mediaItemId: plainItem.mediaId } })
+      const before = 'It was a long night.'.length + 'Morning came. Nobody spoke.'.length
+      expect(progress.ebookProgress).to.equal(before / (before + 'Then the engines started.'.length))
+      expect(progress.ebookLocation).to.match(/^epubcfi\(\/6\/4\[ch2\]!/)
+    })
+
     it('accepts a state with no bookmark at all', async () => {
       const res = await new Kobo(token).request('put', `/v1/library/${item.id}/state`, { ReadingStates: [{ StatusInfo: { Status: 'Reading' } }] })
       expect(res.status).to.equal(200)
@@ -413,12 +477,64 @@ describe('KoboRouter', () => {
       expect(Number.isInteger(bookmark.ProgressPercent)).to.equal(true)
     })
 
-    it('marks the book finished, and only the device reopening it unfinishes it', async () => {
+    it('marks the book finished and never unfinishes it, which would reset the audiobook', async () => {
+      const freshUser = await Database.userModel.getUserById(user.id)
+      await freshUser.createUpdateMediaProgressFromPayload({ libraryItemId: item.id, currentTime: 100 })
       const kobo = new Kobo(token)
       await kobo.request('put', `/v1/library/${item.id}/state`, { ReadingStates: [{ StatusInfo: { Status: 'Finished' } }] })
       expect((await getProgress()).isFinished).to.equal(true)
-      await kobo.request('put', `/v1/library/${item.id}/state`, { ReadingStates: [{ StatusInfo: { Status: 'Reading' } }] })
-      expect((await getProgress()).isFinished).to.equal(false)
+      await kobo.request('put', `/v1/library/${item.id}/state`, {
+        ReadingStates: [{ StatusInfo: { Status: 'Reading' }, CurrentBookmark: { Location: { Source: 'OEBPS/ch2.xhtml', Type: 'KoboSpan', Value: 'kobo.1.1' } } }]
+      })
+      const progress = await getProgress()
+      expect(progress.isFinished).to.equal(true)
+      expect(progress.currentTime).to.equal(100)
+    })
+
+    it('does not resend a reading state when only the audiobook position moves', async () => {
+      const kobo = new Kobo(token)
+      await kobo.syncAll()
+      await kobo.sync()
+      const freshUser = await Database.userModel.getUserById(user.id)
+      await freshUser.createUpdateMediaProgressFromPayload({ libraryItemId: item.id, ebookProgress: 0.5 })
+      const changed = (await kobo.sync()).body.filter((entry) => entry.ChangedReadingState)
+      expect(changed).to.have.length(1)
+      const sent = changed[0].ChangedReadingState.ReadingState
+      expect((await kobo.sync()).body).to.deep.equal([])
+
+      await new Promise((resolve) => setTimeout(resolve, 5))
+      await freshUser.createUpdateMediaProgressFromPayload({ libraryItemId: item.id, currentTime: 42 })
+      expect((await kobo.sync()).body).to.deep.equal([])
+      const get = await kobo.request('get', `/v1/library/${item.id}/state`)
+      expect(get.data[0].LastModified).to.equal(sent.LastModified)
+      expect(get.data[0].CurrentBookmark).to.deep.equal(sent.CurrentBookmark)
+    })
+
+    it('pages changed reading states without losing ties at the page boundary', async () => {
+      const items = [item, await addBook('Second', { path: kepubPath }), await addBook('Third', { path: kepubPath }), await addBook('Entitled', { path: kepubPath })]
+      const freshUser = await Database.userModel.getUserById(user.id)
+      for (const libraryItem of items) await freshUser.createUpdateMediaProgressFromPayload({ libraryItemId: libraryItem.id, ebookProgress: 0.25 })
+      // Three changes in the same millisecond, and a later one sent inside an entitlement
+      const tie = Date.now() - 60000
+      await Database.sequelize.query('UPDATE mediaProgresses SET updatedAt = :date', { replacements: { date: new Date(tie) } })
+      await Database.sequelize.query('UPDATE mediaProgresses SET updatedAt = :date WHERE mediaItemId = :id', { replacements: { date: new Date(tie + 10000), id: items[3].mediaId } })
+      const heldItems = []
+      for (const { id } of items) {
+        const libraryItem = await Database.libraryItemModel.getExpandedById(id)
+        heldItems.push({ id, mediaId: libraryItem.mediaId, libraryItem })
+      }
+      const sentIds = (result) => result.states.map((state) => state.EntitlementId)
+
+      const first = await KoboReadingStateManager.getChangedReadingStates(freshUser, heldItems, 0, new Set([items[3].id]), 2)
+      expect(first.states).to.have.length(2)
+      expect(first).to.include({ hasMore: true, lastModified: tie })
+
+      const second = await KoboReadingStateManager.getChangedReadingStates(freshUser, heldItems, first.lastModified, new Set(), 2)
+      expect([...sentIds(first), ...sentIds(second)].sort()).to.deep.equal(items.map((libraryItem) => libraryItem.id).sort())
+      expect(second).to.include({ hasMore: false, lastModified: tie + 10000 })
+
+      const third = await KoboReadingStateManager.getChangedReadingStates(freshUser, heldItems, second.lastModified, new Set(), 2)
+      expect(third.states).to.deep.equal([])
     })
 
     it('does not unfinish a book finished elsewhere when the device says Reading', async () => {
@@ -478,9 +594,13 @@ describe('KoboRouter', () => {
 
     it('accepts but ignores collection edits from a user without permission', async () => {
       await user.update({ type: 'user', permissions: Database.userModel.getDefaultPermissionsForUserType('user') })
-      const res = await new Kobo(token).request('post', '/v1/library/tags', { Name: 'Nope', Items: [] })
+      const kobo = new Kobo(token)
+      const res = await kobo.request('post', '/v1/library/tags', { Name: 'Nope', Items: [] })
       expect(res.status).to.equal(201)
       expect(await Database.collectionModel.count()).to.equal(0)
+      // Follow-up edits of that collection succeed too, so the device's queue moves on
+      expect((await kobo.request('post', `/v1/library/tags/${res.data}/items`, { Items: [] })).status).to.equal(201)
+      expect((await kobo.request('post', `/v1/library/tags/${res.data}/items/delete`, { Items: [] })).status).to.equal(200)
     })
   })
 
@@ -541,7 +661,7 @@ describe('KoboRouter', () => {
     })
 
     it('names a kepub download .kepub.epub', async () => {
-      const item = await addBook('Already Kepub', { ebookFormat: 'kepub' })
+      const item = await addBook('Already Kepub', { path: kepubPath })
       const res = await new Kobo(token).request('get', `/download/${item.id}/kepub`)
       expect(res.headers['content-disposition']).to.include('Already Kepub.kepub.epub')
     })

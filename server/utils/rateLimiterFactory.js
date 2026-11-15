@@ -11,6 +11,7 @@ class RateLimiterFactory {
 
   constructor() {
     this.authRateLimiter = null
+    this.koboRateLimiter = null
   }
 
   /**
@@ -18,15 +19,29 @@ class RateLimiterFactory {
    * @returns {RateLimitRequestHandler}
    */
   getAuthRateLimiter() {
-    if (this.authRateLimiter) {
-      return this.authRateLimiter
-    }
+    if (!this.authRateLimiter) this.authRateLimiter = this.createAuthRateLimiter()
+    return this.authRateLimiter
+  }
 
+  /**
+   * Get the Kobo device token rate limiter: the same limits, counting only failed token lookups
+   * (a sync makes dozens of requests a minute)
+   * @returns {RateLimitRequestHandler}
+   */
+  getKoboRateLimiter() {
+    if (!this.koboRateLimiter) this.koboRateLimiter = this.createAuthRateLimiter({ skipSuccessfulRequests: true, requestWasSuccessful: (req) => !req.koboAuthFailed })
+    return this.koboRateLimiter
+  }
+
+  /**
+   * @param {Object} [options] extra express-rate-limit options
+   * @returns {RateLimitRequestHandler}
+   */
+  createAuthRateLimiter(options = {}) {
     // Disable by setting max to 0
     if (process.env.RATE_LIMIT_AUTH_MAX === '0') {
-      this.authRateLimiter = (req, res, next) => next()
       Logger.info(`[RateLimiterFactory] Authentication rate limiting disabled by ENV variable`)
-      return this.authRateLimiter
+      return (req, res, next) => next()
     }
 
     let windowMs = RateLimiterFactory.DEFAULT_WINDOW_MS
@@ -50,7 +65,8 @@ class RateLimiterFactory {
       message = process.env.RATE_LIMIT_AUTH_MESSAGE
     }
 
-    this.authRateLimiter = rateLimit({
+    const rateLimiter = rateLimit({
+      ...options,
       windowMs,
       max,
       standardHeaders: true,
@@ -75,7 +91,7 @@ class RateLimiterFactory {
 
     Logger.debug(`[RateLimiterFactory] Created auth rate limiter: ${max} attempts per ${windowMs / 1000 / 60} minutes`)
 
-    return this.authRateLimiter
+    return rateLimiter
   }
 }
 

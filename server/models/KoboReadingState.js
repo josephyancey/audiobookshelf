@@ -31,8 +31,8 @@ class KoboReadingState extends Model {
     this.lastModified
     /** @type {string} The device's PriorityTimestamp, verbatim */
     this.priorityTimestamp
-    /** @type {Date} updatedAt of the media progress this state was applied as */
-    this.progressUpdatedAt
+    /** @type {string} Ebook location, progress and finished state of the media progress this state stands for */
+    this.snapshot
     /** @type {Date} */
     this.createdAt
     /** @type {Date} */
@@ -69,7 +69,7 @@ class KoboReadingState extends Model {
         statistics: DataTypes.JSON,
         lastModified: DataTypes.STRING,
         priorityTimestamp: DataTypes.STRING,
-        progressUpdatedAt: DataTypes.DATE
+        snapshot: DataTypes.STRING
       },
       {
         sequelize,

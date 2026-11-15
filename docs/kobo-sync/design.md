@@ -1,209 +1,93 @@
-# Kobo sync in Audiobookshelf: design
+# Kobo sync
 
-Status: agreed 2026-11-14. Branch `kobo-sync`.
+A stock Kobo e-reader (no KOReader, one config line) syncs ebooks, reading progress and collections with Audiobookshelf the way it does with Calibre-Web (CW). The wire protocol is CW's `kobo.py`; where CW has a known bug, the fix (from Calibre-Web-Automated or an open upstream PR) is taken instead.
 
-Goal: a stock Kobo e-reader (no KOReader, no mods besides one config line) syncs ebooks and reading progress with Audiobookshelf exactly the way it does with Calibre-Web (CW), while the code reads as native ABS.
+## Setup
 
-Reference docs, both in this folder:
-
-- `calibre-web-reference.md`: CW and CWA behavior, every endpoint and JSON shape, and 32 numbered lessons from their history. "Lesson N" below refers to that list.
-- `abs-conventions.md`: how ABS is built. File paths below follow it.
-
-The rule for every decision: **behave like CW on the wire; where CW has a known bug, take the fix (CWA's, or the open upstream PR's), not the bug.**
-
----
-
-## 1. What the user sees
-
-1. Admin: **Settings → Kobo sync** (new page under `client/pages/config/`). One switch to enable Kobo sync server-wide, one switch "Forward unknown requests to the Kobo store" (on by default), and an optional **public URL** used in every link sent to the device (Lesson 7).
-2. User: **Account → Kobo devices**, next to "Ereader devices". "Add device" asks for a name (e.g. "Libra Colour") and which libraries to sync (default: all the user can access). It shows the line to paste into the Kobo once:
+1. Admin: **Settings → Kobo sync**. Enable Kobo sync, choose whether unknown requests are forwarded to the Kobo store (on by default), and optionally set a **public URL**. Kobos drop the port from the `Host` header, so every URL sent to a device uses the public URL when set, else the request host.
+2. User (needs download permission): **Account → Kobo devices → Add device**. Pick a name and the libraries to sync (default: all the user can access), optionally "only sync selected collections". The setup line is shown once:
 
    ```
    api_endpoint=https://audiobooks.example.com/kobo/<token>
    ```
 
-   Each device row has: rename, choose libraries, "only sync selected collections" toggle, **Resync everything**, delete.
-3. On the Kobo: paste the line into `.kobo/Kobo/Kobo eReader.conf`, eject, tap Sync. Books appear with covers; reading position flows both ways; the Kobo store keeps working.
+   Each device can be edited, resynced ("Resync everything"), given a new setup line, or deleted.
+3. On the Kobo: replace the `api_endpoint` line in `.kobo/Kobo/Kobo eReader.conf`, eject, tap Sync.
 
----
+## Code
 
-## 2. Server layout (new files)
-
-| File | Role | ABS template |
-|---|---|---|
-| `server/routers/KoboRouter.js` | Express app mounted at `/kobo/:token`; token → device → user; catch-all | `PublicRouter.js` |
-| `server/controllers/KoboController.js` | Device-facing handlers: init, auth stubs, sync, metadata, state, tags, delete, cover, download | `ShareController.js` |
-| `server/controllers/KoboDeviceController.js` | User-facing `/api/me/kobo-devices` CRUD + resync (mounted in `ApiRouter`) | `ApiKeyController.js` |
-| `server/managers/KoboSyncManager.js` | Builds sync pages; owns delivery state and checkpoints | `RssFeedManager.js` |
-| `server/managers/KoboReadingStateManager.js`, `KoboCollectionManager.js` | Reading progress both ways; collection edits from the device | — |
-| `server/managers/KoboStoreProxy.js` | Forwarding to `storeapi.kobo.com`, 307 vs server-side proxy | — |
-| `server/utils/kobo/syncToken.js` | Encode/decode `x-kobo-synctoken` | — |
-| `server/utils/kobo/koboJson.js` | `BookEntitlement`, `BookMetadata`, `ReadingState`, `Tag` builders, timestamp format | — |
-| `server/utils/kobo/koboResources.js` | Native `/v1/initialization` resource dict + overrides | — |
-| `server/utils/kobo/kepubPosition.js` | KoboSpan ↔ CFI ↔ exact fraction | — |
-| `server/managers/KepubManager.js` | On-demand kepubify conversion + cache | `CoverManager` / cache paths |
-| `server/models/KoboDevice.js`, `KoboSyncedItem.js`, `KoboReadingState.js`, `KoboSyncedCollection.js` | Data | `ApiKey.js` |
-| `server/migrations/v2.38.0-add-kobo-sync-tables.js` | Creates the tables; idempotent | `v2.26.0-create-auth-tables.js` |
-| `client/pages/config/kobo.vue`, `client/components/modals/KoboDeviceModal.vue`, section in `client/pages/account.vue` | UI | ereader devices UI |
-| `test/server/...` | Mocha tests mirroring the above | existing tests |
-
-`package.json` version bumps to `2.38.0` so the migration runs on existing databases (ABS only runs migrations newer than the DB's stored version). The migration is safe to run twice, so a later rebase onto an upstream `2.38.x` doesn't break.
-
-Style: no semicolons, single quotes, JSDoc on every handler, `Logger.info('[KoboController] ...')`, plain-text error responses, try/catch around every await that can reject.
-
----
-
-## 3. Data model
-
-All keyed by **device**, not user (Lesson 26: CW's per-user state means a second Kobo gets nothing).
-
-**`koboDevice`**: `id` (uuid), `userId` (cascade), `name`, `tokenHash` (sha256 of the URL token; token shown once, like API keys), `libraryIds` (JSON, null = all accessible), `onlyCollections` (bool), `lastSyncAt`, `lastUserAgent`, `lastIp`, `createdAt/updatedAt`. Token is 32 hex chars from `crypto.randomBytes(16)`, same shape as CW.
-
-**`koboSyncedItem`**: `koboDeviceId`, `libraryItemId` (not a foreign key, so a deleted item can still be removed from the device), the confirmed state (`deliveredAt`, `deliveredVersion`, `deliveredFormat`, `isRemoved`, `removedBy` = `device`|`scope`) and the unconfirmed state (`pendingCheckpoint`, `pendingVersion`, `pendingFormat`, `pendingRemoved`). Unique (`koboDeviceId`, `libraryItemId`). This is CW's `kobo_synced_books`, made per device and confirmed by checkpoint (§5).
-
-**`koboReadingState`**: per user per item, not per device (progress is the user's, as in CW). The raw last `CurrentBookmark`, `StatusInfo`, `Statistics`, the device's own `LastModified`/`PriorityTimestamp` strings, and `progressUpdatedAt` (the media progress it was applied as), so the device's state can be handed back verbatim (Lesson 9c).
-
-**`koboSyncedCollection`**: `koboDeviceId`, `collectionId`, `deliveredHash` (sha1 of name + full book list, because adding a book to an ABS collection doesn't touch the collection's `updatedAt`), `isDeleted`, and the same pending/checkpoint fields. A `DeletedTag` is sent for delivered rows whose collection is gone or out of scope. This replaces the tombstone table first sketched here.
-
-JSON numbers: JavaScript has no int/float distinction, so a `50` from the device always goes back as `50` (Lesson 9a is satisfied by construction).
-
-ABS progress stays the source of truth: `mediaProgress.ebookProgress`, `ebookLocation`, `isFinished`. `koboReadingState` only remembers the Kobo-specific representation so round trips are exact.
-
----
-
-## 4. Auth and routing
-
-- Mounted in `Server.start()` like `/public`, without the `/api` auth middleware: `router.use('/kobo/:token', this.koboRouter.router)`.
-- Token lookup: hash, find `koboDevice`, load user, reject inactive users and devices of disabled feature with **401** (CW behavior). Sets `req.user` and `req.koboDevice`, so `req.user.checkCanAccessLibraryItem` and `createUpdateMediaProgressFromPayload` work unchanged.
-- Failed lookups go through `rateLimiterFactory` (Lesson 32: only failed tokens are throttled; a real sync makes dozens of calls a minute).
-- Download role: users without `canDownload` get **403 on sync** (CW behavior, Lesson 22). Library access restrictions apply to every lookup.
-- **Public base URL** (Lesson 7): every absolute URL sent to the device is built from the admin's public URL setting if set, else `req.originalHostPrefix`. Kobos drop the port from `Host`; the setting is the fix, and the UI warns when the generated `api_endpoint` would be `localhost`.
-- **Catch-all** under `/kobo/:token/*` (Lesson 13): forward to the store when the proxy is on, else `{}` 200, and log the path at debug. Unknown endpoints never 404.
-
----
-
-## 5. Sync (`GET /v1/library/sync`)
-
-The wire format is CW's: base64 JSON in `x-kobo-synctoken` (a **string** header, Lesson 6), pages of at most 100 items, `x-kobo-sync: continue` while more remain, JSON body with `charset=utf-8` (Lesson 21).
-
-**Token contents** (version `1-1-0` shape kept, plus our fields):
-
-```json
-{ "version": "1-1-0", "data": {
-  "raw_kobo_store_token": "",
-  "checkpoint": "<id of the page this token was issued with>",
-  "reading_state_last_modified": 0,
-  "tags_last_modified": 0 } }
-```
-
-- A header containing `.` is a raw store token (first sync after switching from the store): keep it, start fresh. Bad base64/JSON: start fresh, log once. Missing padding tolerated.
-
-**Which items go in a page** (fixes Lessons 1–5 and 2's open truncation bug by not mixing cursors):
-
-1. Scope: library items in the device's libraries that the user can access, with an `ebookFile` of format epub or kepub (pdf/mobi skipped, like CW). In "only selected collections" mode, items in collections flagged for this device.
-2. **Pending = in scope and (not in `koboSyncedItem` for this device, or `libraryItem.updatedAt > deliveredItemUpdatedAt`, or cover changed)**, plus **removals = in `koboSyncedItem`, not `removed`, but no longer in scope** (CWA's set-difference fix for removed-from-shelf, Lesson 20/§8).
-3. Order by `(updatedAt, id)`, take 101 to know if more remain (Lesson 3).
-4. Each emitted row is written with `pendingCheckpoint = <new checkpoint id>`, not yet delivered.
-5. **Delivery confirmation** (Lesson 1): when the device next calls sync presenting checkpoint X, all rows with `pendingCheckpoint = X` become delivered. If the device aborted and comes back with an older token, unconfirmed rows are simply pending again and get re-sent. CW marks them sent while building the response; that is the bug that loses books.
-6. New vs changed (Lesson 4): `NewEntitlement` if this device has never confirmed the item, else `ChangedEntitlement`. No timestamp guessing.
-7. Per-item isolation (Lesson 12): a book whose JSON fails to build is logged and skipped, never 500s the page. Missing dates fall back to `addedAt` → `createdAt` → now; series index to 1 (keeping 0 as 0); language to `en`.
-
-**Reading states in the stream**: `ChangedReadingState` for items whose ABS progress changed since `reading_state_last_modified` (and were not just emitted inside an entitlement this page), capped at 100, ordered by update time (CW behavior).
-
-**Collections → Kobo collections (Tags)**: `NewTag`/`ChangedTag` with the full item list, `DeletedTag` from tombstones (§8). Not paginated (CW behavior).
-
-**Store merge** (proxy on): only on the final local page, call the store's sync with our stored `raw_kobo_store_token`, append its results, keep its new token inside ours, copy `x-kobo-sync`/`x-kobo-sync-mode`/`x-kobo-recent-reads` only when present (CW copies `None`). Timeout 2 s connect / 10 s read; on failure log and send our page alone.
-
-**Resync everything** (device menu): delete that device's `koboSyncedItem` rows; next sync re-sends all as new.
-
----
-
-## 6. Entitlement and metadata JSON
-
-Field-for-field CW §5.1–5.3, sourced from ABS:
-
-| Kobo field | ABS source |
+| File | Role |
 |---|---|
-| ids (`Id`, `RevisionId`, `CrossRevisionId`, `EntitlementId`, `WorkId`) | `libraryItem.id` (uuid) |
-| `Title`, `Description`, `Publisher.Name`, `PublicationDate`, `Language` | `book.title`, `description`, `publisher`, `publishedDate`/`publishedYear`, `language` → ISO 639-1 |
-| `Contributors`, `ContributorRoles` | `book.authors` (all; no `Role` key) |
-| `Series` | first series + `sequence`; `Id` = uuid3(DNS, series name) like CW |
-| `CoverImageId` | `<itemId>-<cover version>` (CWA cache-buster, Lesson 19); suffix stripped on request |
-| `IsRemoved` | removal per §5.2 / §8 |
-| `Created`, `LastModified` | `addedAt`, `updatedAt` |
+| `server/routers/KoboRouter.js` | Mounted at `/kobo/:token`; token → device → user; catch-all |
+| `server/controllers/KoboController.js` | Device requests: init, auth stubs, sync, metadata, state, tags, delete, cover, download |
+| `server/controllers/KoboDeviceController.js` | `/api/me/kobo-devices` CRUD, new token, resync |
+| `server/managers/KoboSyncManager.js` | Sync pages, delivery state, checkpoints |
+| `server/managers/KoboReadingStateManager.js` | Reading progress both ways |
+| `server/managers/KoboCollectionManager.js` | Collection edits made on the device |
+| `server/managers/KoboStoreProxy.js` | Forwarding to `storeapi.kobo.com` |
+| `server/managers/KepubManager.js` | On-demand kepubify conversion and cache |
+| `server/utils/kobo/` | Sync token, entitlement/metadata JSON, native resources, KoboSpan ↔ CFI mapping |
+| `server/models/Kobo*.js` | Data, created by `sequelize.sync()` like `mediaItemShare` (no migration) |
+| `client/pages/config/kobo.vue`, `client/components/modals/KoboDeviceModal.vue`, `client/pages/account.vue` | UI |
 
-Timestamps: `YYYY-MM-DDTHH:MM:SSZ`, no fractions, all compared as UTC epoch ms internally (Lesson 28).
+## Data model
 
-**Download URLs** (Lessons 10, 30): KEPUB is offered whenever possible. If the ebook is a kepub, or kepubify is available, one entry `{"Format":"KEPUB","Url":".../download/<itemId>/kepub"}`; otherwise `EPUB3` + `EPUB` entries to the same epub URL. Fixed-layout epubs (`rendition:layout = pre-paginated`) are advertised as `EPUB3FL`. `"DrmType": "None"` (CWA). Size is the real file size.
+- **`koboDevice`**: `userId`, `name`, `tokenHash` (sha256 of the 32 hex char URL token; the token itself is only shown once), `libraryIds` (null = all), `onlyCollections`, `collectionIds`, `lastSyncAt`.
+- **`koboSyncedItem`**: per device and library item (not a foreign key, so a deleted item can still be removed from the device). Delivered state (`deliveredAt`, `deliveredVersion`, `deliveredFormat`, `isRemoved`, `removedBy = 'device'` when deleted on the Kobo) and pending state (`pendingCheckpoint`, `pendingVersion`, `pendingFormat`, `pendingRemoved`). Unique (`koboDeviceId`, `libraryItemId`).
+- **`koboSyncedCollection`**: per device and collection, `deliveredHash` (sha1 of name + book list; adding a book does not touch a collection's `updatedAt`), `isDeleted`, and the same pending fields.
+- **`koboReadingState`**: per user and item (progress belongs to the user). The device's raw `CurrentBookmark`, `StatusInfo`, `Statistics`, its `LastModified`/`PriorityTimestamp` strings, and `snapshot`: the ebook location, ebook progress and finished flag of the media progress this state stands for.
 
-**Covers**: `/<imageId>/<w>/<h>[/<quality>]/<greyscale>/image.jpg`, parsed leniently (`{height}` literal → small, Lesson 18), JPEG always, through ABS's existing ffmpeg resize cache, three fixed widths. Unknown id: 307 to `cdn.kobo.com/book-images/...` when the proxy is on (store books' covers), else 404.
+Delivery state is per device, so a second Kobo gets every book.
 
----
+## Sync (`GET /v1/library/sync`)
 
-## 7. Reading progress both ways
+- `x-kobo-synctoken` is base64 JSON `{ version: '1-1-0', data: { raw_kobo_store_token, checkpoint, reading_state_last_modified } }`, sent as a plain string. A token containing `.` is the store's own (first sync after switching): it is kept and the sync starts fresh. Anything unreadable starts fresh.
+- **Scope**: items in the device's libraries the user can access, with an epub (a `.kepub.epub` file counts as one), limited to the selected collections in collection mode. Items marked missing (e.g. a share unmounted during a scan) are neither sent nor removed; the device keeps what it has until they return.
+- **Pending**: in scope and never delivered, or newer than the delivered version, or now in a different format; plus **removals**: delivered, not removed, no longer in scope (library unselected, collection unflagged, ebook or item deleted, access lost). Items deleted on the Kobo stay off that device until "Resync everything".
+- Pages of 100, ordered by change time, `x-kobo-sync: continue` while more remain. `NewEntitlement` if the device never confirmed the item, else `ChangedEntitlement`. A book whose JSON fails to build is logged and skipped.
+- **Checkpoints**: every page gets a new checkpoint id; its rows are written as pending under it. Only when the device presents that checkpoint in its next sync token do they become delivered. CW marks books sent while building the response, which loses them when the device aborts a page; here an unconfirmed page is simply sent again.
+- **Reading states**: `ChangedReadingState` for held books whose progress or stored Kobo state changed since the cursor (see below), at most 100 per page.
+- **Collections**: `NewTag`/`ChangedTag` with the full book list, `DeletedTag` for delivered collections that are gone or out of scope. Not paginated (CW behavior).
+- **Store merge** (forwarding on): on the last local page only, the store's own sync is fetched with the stored store token and appended; its new token is kept inside ours and `x-kobo-sync`, `x-kobo-sync-mode`, `x-kobo-recent-reads` are copied when present.
+- Timestamps go out as `YYYY-MM-DDTHH:MM:SSZ`. Cover ids are `<itemId>-<version seconds>`, so a new cover reaches the device. Series ids are `uuid3(DNS, name)` like CW.
 
-**Device → ABS** (`PUT /v1/library/<id>/state`):
+## Reading progress
 
-1. Every key optional (Lesson 11). Never 400 on a missing key.
-2. Store the raw `CurrentBookmark`, `StatusInfo`, `Statistics` and the device's `LastModified` in `koboReadingState`, verbatim.
-3. Convert to ABS progress with `kepubPosition.js`: KoboSpan → exact fraction + CFI; else chapter + in-chapter percent; else whole-book percent. Requires the same file the device has, i.e. the kepub ABS served it.
-4. Call `user.createUpdateMediaProgressFromPayload({ libraryItemId, ebookProgress, ebookLocation, isFinished, lastUpdate })` and emit `user_updated` exactly like `PATCH /api/me/progress`, so the web UI, the apps and BookBridge see it.
-5. `Status: Finished` → `isFinished: true`. Reading → not finished. (ABS `isFinished` covers the whole item, audio included; finishing the ebook finishes the item, same as ABS's own reader.)
-6. Response: CW's `{"RequestResult":"Success","UpdateResults":[...]}` **without** server-stamped `LastModified`/`PriorityTimestamp` (open PR #3607, Lesson 9c).
+ABS media progress (`ebookLocation` CFI, `ebookProgress`, `isFinished`) is the source of truth.
 
-**ABS → device** (`GET .../state` and `ChangedReadingState` in sync):
+**Device → ABS** (`PUT /v1/library/<id>/state`): every key is optional. The raw state is stored, the bookmark is converted with `kepubPosition.js` (KoboSpan → exact fraction + CFI against the original epub; else chapter + in-chapter percent; else book percent; a KoboSpan bookmark converts the kepub on demand when it is not cached, since kepubify v4 output is deterministic) and applied with `user.createUpdateMediaProgressFromPayload`, followed by `user_updated` like `PATCH /api/me/progress`. The answer carries no server-stamped `LastModified` (CW PR #3607).
 
-1. If ABS progress hasn't changed since the stored Kobo bookmark, return the stored Kobo state **verbatim**, numbers exactly as received (int stays int, Lesson 9a/b). This is what stops "Return to last page read?" popups.
-2. If ABS progress is newer (web reader, phone app, BookBridge moved it from the audiobook), build a new bookmark: CFI → chapter + character → the KoboSpan at or before it (`Location: {Source, Type:"KoboSpan", Value}`), plus `ProgressPercent` (integer, like the device) and `ContentSourceProgressPercent`. `LastModified` = PriorityTimestamp = the ABS progress `lastUpdate`, so the device sees a newer position and jumps to it.
-3. No CFI (percent-only progress): place the percent across chapters by character count and pick the span there (BookBridge's fallback).
-4. Status: `isFinished` → `Finished`; progress > 0 → `Reading`; else `ReadyToRead`.
+- `Finished` → `isFinished: true`. The Kobo **never** sends `isFinished: false`: unfinishing an ABS item resets the audiobook position to 0, so a book reopened on the Kobo stays finished in ABS.
+- The stored row gets the snapshot of the resulting media progress.
 
----
+**ABS → device** (`GET .../state`, entitlements, `ChangedReadingState`):
 
-## 8. Deleting and removing
+- While the current media progress snapshot equals the stored one, the stored Kobo state is returned verbatim (same numbers and timestamps). Anything else makes the Kobo ask "Return to last page read?".
+- When it differs (the web reader, an app or BookBridge moved the ebook position), a bookmark is built: CFI → character → the KoboSpan at or before it, with integer `ProgressPercent` and `ContentSourceProgressPercent`; `LastModified` is the progress's `updatedAt`. It is stored as the new Kobo state with the new snapshot, so later calls return it verbatim.
+- Audio playback changes `mediaProgress.updatedAt` constantly but not the snapshot, so it never resends a state. A candidate whose snapshot matches and whose stored row is not newer than the cursor is skipped.
+- Cursor: candidates are progress rows and stored states with `updatedAt >= cursor`. While more remain than fit, the cursor is the last processed item's time (ties at that time are picked up next page; the ones already sent are skipped by the snapshot rule). Only when nothing remains does it move past everything, including states sent inside entitlements.
+- After a kepub download, a stored state without a KoboSpan is rebuilt on the next sync so the device gets an exact position.
 
-| Event | Behavior |
-|---|---|
-| User deletes a book **on the Kobo** | `DELETE /v1/library/<id>` → mark `removed` for **that device only**, 204. Not hidden anywhere in ABS (ABS has no per-user archive). The book stays off that device until the user taps "Resync everything" or re-adds it in the device's settings. |
-| Item leaves scope (library unselected, removed from synced collection, ebook deleted, item deleted, user loses access) | Next sync sends `ChangedEntitlement` with `IsRemoved: true`; row marked `removed`. This covers CW's open "removed from shelf stays on device" and "hard delete never propagates" bugs. |
-| Collection deleted, or unflagged for the device | Tombstone → `DeletedTag`, tombstone removed after checkpoint confirmation. |
-| Device deleted in ABS | Its rows cascade away. |
+## KEPUB
 
----
+Never converted during sync (only on download, or for a KoboSpan bookmark from the device). When kepubify is available (or the file already is a `.kepub.epub`), the entitlement offers one `KEPUB` download; otherwise `EPUB3` + `EPUB`. Fixed-layout epubs (`rendition:layout` `pre-paginated`) are offered as `EPUB3FL`.
 
-## 9. KEPUB conversion
+- On download, `KepubManager` runs `kepubify <src> -o <unique temp dir> -i` (120 s timeout, one conversion per cache file at a time) and moves the result to `<metadata>/cache/kepub/<itemId>-<ebook mtime>.kepub.epub`, removing that item's older conversions. On failure the epub is served. The file is served as `<title>.kepub.epub`, which the Kobo uses to pick its kepub renderer.
+- The Docker image bundles kepubify **v4.0.4** and sets `KEPUBIFY_PATH`. Other installs set `KEPUBIFY_PATH` to a kepubify binary themselves; without it sync works with plain EPUB (reading positions are then chapter-level on the device).
+- Pinned to v4.0.4, not v5: kepubify v5 (2026-11-08) says its output, including koboSpan numbering, may differ from v4. A Kobo's bookmarks name koboSpans in the file it downloaded, so the server must convert the same way. Moving to v5 means clearing the kepub cache and re-sending books.
 
-CWA's approach (Lesson 23): never convert during sync; advertise KEPUB; convert on the download request.
+## Store forwarding
 
-- `KepubManager.getKepub(libraryItem)`: cache at `<MetadataPath>/cache/kepub/<itemId>-<ebook mtime>.kepub.epub`; run `kepubify <src> -o <tmp dir>` into a unique temp dir (CWA 7536a81: shared temp names served the wrong book), move into the cache; one conversion per item at a time (promise lock); 120 s timeout; on failure log and serve the epub.
-- Served with `Content-Disposition` filename `*.kepub.epub` (Lesson 10).
-- Binary: Docker downloads `kepubify-linux-64bit` / `-arm64` in the `build-server` stage like libnusqlite3, `ENV KEPUBIFY_PATH`; non-Docker installs get a `Binary('kepubify', ...)` in `BinaryManager` with `required = false` and its own `--version` check. Without kepubify, sync still works with plain EPUB (position sync is then chapter-level, Lesson 10).
-- The cache is cleaned when the item is deleted or its ebook changes (mtime in the name makes old entries dead; a cron sweep removes them).
+With forwarding on: unknown GETs get a 307 to `https://storeapi.kobo.com/<path>`; other methods are proxied server side (a Kobo turns a redirected POST into a GET) with hop-by-hop headers stripped and a 10 s timeout; a store failure falls back to `{}` (dummy tokens for auth routes). `/v1/initialization` merges the store's resources but always points `library_sync` and the image templates at ABS, and passes the store's `ExpiredToken` through. Unknown covers redirect to Kobo's CDN.
 
----
+With forwarding off (a Kobo without an account): native resources, dummy auth, OAuth/OIDC stubs under `/kobo/<token>/oauth`, and the reading-services stubs (`/api/v3/content/...`, `/api/UserStorage/...`) answered at the site root ahead of the `/api` router.
 
-## 10. Store proxy and local-only mode
+Unknown endpoints never 404 (a 404 can abort the device's sync queue). Failed token lookups are rate limited with the auth limits (`RATE_LIMIT_AUTH_*`); successful device requests, and store 401s relayed for a valid device, do not count.
 
-Exactly CW's rules (Lesson 25): GET → 307 to `https://storeapi.kobo.com/<path>`; other methods proxied server-side with headers copied minus `Host`, hop-by-hop headers and `content-encoding` stripped, 2 s / 10 s timeouts, failures fall back to `{}` (auth routes fall back to dummy tokens). `/v1/initialization` merges the store's resources and **always** overrides `library_sync`, `image_host`, `image_url_template`, `image_url_quality_template` (Lesson 8). `ExpiredToken` from the store's init is passed through (CWA).
+## Owner decisions
 
-With the proxy off (Kobo with no account, or user preference): native resource dict, dummy `/v1/auth/device|refresh`, `/v1/user/add-device`, `/oauth/*` + OIDC discovery stubs, and `oauth_host`/`reading_services_host` pointed at ABS (Lesson 14). The reading-services stubs live at the **site root** (`/api/v3/content/...`, `/api/UserStorage/...`), which collides with ABS's own `/api` router: they must be registered before `ApiRouter` and match only those exact Kobo paths. This mode ships last (phase 4).
-
----
-
-## 11. Phases
-
-Each phase ends with tests passing and a real-device check.
-
-1. **Books on the device.** Models + migration, `KoboRouter` with token auth, init, auth stubs, catch-all, store proxy, sync of entitlements with checkpoint confirmation, metadata, covers, downloads (epub as-is), device UI (add/delete/resync), admin page.
-2. **KEPUB.** kepubify bundling, on-demand conversion, `.kepub.epub` naming, `EPUB3FL`.
-3. **Reading progress both ways** with exact positions (§7), `ChangedReadingState` in the stream.
-4. **Collections** as Kobo collections, "only selected collections" mode, removals and tombstones; device-side collection edits applied when permitted (§12).
-5. **Local-only mode** (no Kobo account): OAuth/OIDC and reading-services stubs.
-
----
-
-## 12. Decisions (owner, 2026-11-14)
-
-1. **Collections: two-way when permitted.** ABS collections sync to the device as Kobo collections. Edits made on the Kobo (create, rename, delete, add/remove books) are applied to the ABS collection when the user has the update permission (`canUpdate`; create needs it too, delete needs `canDelete`); otherwise they're answered with 200 and ignored, logged at info. Collections are per library in ABS, so a collection created on the Kobo lands in the library of its first book. A per-device "only sync selected collections" option mirrors CW's shelf mode.
-2. **Deleting on the Kobo removes it from that device only** (§8). Nothing changes in ABS. It stays off that device until "Resync everything" or until it's re-added from the device settings.
+1. **Collections are two-way.** Kobo collection edits (create, rename, delete, add/remove books) are applied to the ABS collection when the user may update (delete needs delete permission); otherwise they are answered and ignored. A collection created on the Kobo lands in the library of its first book.
+2. **Deleting on the Kobo removes the book from that device only.** Nothing changes in ABS.
 3. **One token per device.** Delivery state is per device; reading progress is per user.
+4. **Exact positions.** KoboSpan ↔ CFI mapping is character exact, not percentage based.
+5. **Never unfinish from the Kobo** (see Reading progress).

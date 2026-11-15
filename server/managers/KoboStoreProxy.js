@@ -11,10 +11,10 @@ const STRIPPED_RESPONSE_HEADERS = new Set(['connection', 'content-encoding', 'co
 /**
  * Forwards what this server does not answer itself to the Kobo store, so purchases, the store
  * and OverDrive keep working on a Kobo pointed at Audiobookshelf. Same rules as Calibre-Web
- * (calibre-web-reference.md §7, Lesson 25):
+ * (kobo.py redirect_or_proxy_request):
  * - GET is answered with a 307 to the store, so the device talks to it with its own headers.
  * - Anything else is proxied server side, because a Kobo turns a redirected POST/PUT/DELETE into a GET.
- * - 2 s to connect, 10 s to answer. A store failure never fails the device's request.
+ * - 10 s timeout. A store failure never fails the device's request.
  */
 class KoboStoreProxy {
   constructor() {}

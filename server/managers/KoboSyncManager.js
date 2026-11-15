@@ -6,12 +6,11 @@ const KepubManager = require('./KepubManager')
 const KoboStoreProxy = require('./KoboStoreProxy')
 const KoboReadingStateManager = require('./KoboReadingStateManager')
 const { buildSyncToken } = require('../utils/kobo/syncToken')
+const { isUUID } = require('../utils/index')
 const { buildBookEntitlement, buildBookMetadata, buildRemovedEntitlement, buildTag, buildDeletedTag } = require('../utils/kobo/koboJson')
 
 /** Items per sync page, as Calibre-Web. Larger pages time out on older devices (Calibre-Web #1276). */
 const SYNC_ITEM_LIMIT = 100
-
-const KOBO_EBOOK_FORMATS = ['epub', 'kepub']
 
 /**
  * @typedef ScopeItem
@@ -19,11 +18,16 @@ const KOBO_EBOOK_FORMATS = ['epub', 'kepub']
  * @property {string} mediaId
  * @property {number} version epoch ms of the latest change to the item or its book
  * @property {'kepub'|'epub'} format the format this device should receive
- * @property {string} ebookPath
+ * @property {import('../models/LibraryItem')} libraryItem with createdAt, media id and ebookFile
+ *
+ * @typedef Scope
+ * @property {Map<string, ScopeItem>} items by libraryItemId
+ * @property {Set<string>} missingIds items marked missing (e.g. an unmounted share): neither sent nor removed
+ * @property {string[]} libraryIds
  */
 
 /**
- * Builds Kobo library sync pages (docs/kobo-sync/design.md §5).
+ * Builds Kobo library sync pages.
  *
  * Calibre-Web decides what to send from a per-user "already sent" table that is written while
  * the response is built. That loses books when the device aborts a page (Calibre-Web-Automated
@@ -32,10 +36,7 @@ const KOBO_EBOOK_FORMATS = ['epub', 'kepub']
  * and a change only counts as delivered once the device presents that checkpoint again.
  */
 class KoboSyncManager {
-  constructor() {
-    /** @type {Map<string, string|null>} ebook path + mtime → rendition layout */
-    this.layoutCache = new Map()
-  }
+  constructor() {}
 
   /**
    * Address the device uses for this server. Kobos drop the port from the Host header
@@ -84,8 +85,8 @@ class KoboSyncManager {
    * @returns {string}
    */
   parseCoverImageId(imageId) {
-    const match = String(imageId || '').match(/^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i)
-    return match ? match[1].toLowerCase() : null
+    const libraryItemId = String(imageId || '').slice(0, 36).toLowerCase()
+    return isUUID(libraryItemId) ? libraryItemId : null
   }
 
   /**
@@ -93,16 +94,7 @@ class KoboSyncManager {
    * @returns {'kepub'|'epub'}
    */
   getDeliveryFormat(ebookFile) {
-    if (this.isKepubFile(ebookFile)) return 'kepub'
-    return KepubManager.isAvailable() ? 'kepub' : 'epub'
-  }
-
-  /**
-   * @param {Object} ebookFile
-   * @returns {boolean}
-   */
-  isKepubFile(ebookFile) {
-    return ebookFile?.ebookFormat === 'kepub' || /\.kepub(\.epub)?$/i.test(ebookFile?.metadata?.filename || '')
+    return KepubManager.isKepub(ebookFile) || KepubManager.isAvailable() ? 'kepub' : 'epub'
   }
 
   /**
@@ -110,73 +102,53 @@ class KoboSyncManager {
    *
    * @param {import('../models/User')} user
    * @param {import('../models/KoboDevice')} device
-   * @returns {Promise<Map<string, ScopeItem> & { libraryIds?: string[] }>}
+   * @returns {Promise<Scope>}
    */
   async getScope(user, device) {
-    const libraries = await Database.libraryModel.findAll({ attributes: ['id', 'mediaType'] })
-    const bookLibraryIds = libraries.filter((library) => library.mediaType === 'book').map((library) => library.id)
-    const libraryIds = device.getLibraryIdsToSync(user, bookLibraryIds)
-    /** @type {Map<string, ScopeItem> & { libraryIds?: string[] }} */
-    const scope = new Map()
-    scope.libraryIds = libraryIds
+    const libraries = await Database.libraryModel.findAll({ attributes: ['id'], where: { mediaType: 'book' } })
+    const libraryIds = device.getLibraryIdsToSync(user, libraries.map((library) => library.id))
+    /** @type {Scope} */
+    const scope = { items: new Map(), missingIds: new Set(), libraryIds }
     if (!libraryIds.length) return scope
 
     const libraryItems = await Database.libraryItemModel.findAll({
-      attributes: ['id', 'libraryId', 'mediaId', 'mediaType', 'updatedAt', 'isMissing', 'isInvalid'],
+      attributes: ['id', 'libraryId', 'mediaId', 'mediaType', 'isMissing', 'createdAt', 'updatedAt'],
       where: {
         libraryId: libraryIds,
-        mediaType: 'book',
-        isMissing: { [Op.not]: true },
         isInvalid: { [Op.not]: true }
       },
       include: {
         model: Database.bookModel,
         attributes: ['id', 'updatedAt', 'ebookFile', 'explicit', 'tags'],
-        required: true
+        where: { ebookFile: { [Op.ne]: null } }
       }
     })
 
     let allowedMediaIds = null
     if (device.onlyCollections) {
-      const collectionIds = Array.isArray(device.collectionIds) ? device.collectionIds : []
-      const collectionBooks = collectionIds.length ? await Database.collectionBookModel.findAll({ attributes: ['bookId'], where: { collectionId: collectionIds } }) : []
+      const collectionBooks = await Database.collectionBookModel.findAll({ attributes: ['bookId'], where: { collectionId: device.collectionIds || [] } })
       allowedMediaIds = new Set(collectionBooks.map((collectionBook) => collectionBook.bookId))
     }
 
     for (const libraryItem of libraryItems) {
-      const ebookFile = libraryItem.media?.ebookFile
-      if (!ebookFile?.metadata?.path || !KOBO_EBOOK_FORMATS.includes(String(ebookFile.ebookFormat || '').toLowerCase())) continue
+      if (libraryItem.isMissing) {
+        scope.missingIds.add(libraryItem.id)
+        continue
+      }
+      const ebookFile = libraryItem.media.ebookFile
+      // pdf, mobi and the like are not sent, as in Calibre-Web
+      if (ebookFile.ebookFormat !== 'epub' || !ebookFile.metadata?.path) continue
       if (allowedMediaIds && !allowedMediaIds.has(libraryItem.mediaId)) continue
       if (!user.checkCanAccessLibraryItem(libraryItem)) continue
-      scope.set(libraryItem.id, {
+      scope.items.set(libraryItem.id, {
         id: libraryItem.id,
         mediaId: libraryItem.mediaId,
         version: this.getItemVersion(libraryItem),
         format: this.getDeliveryFormat(ebookFile),
-        ebookPath: ebookFile.metadata.path
+        libraryItem
       })
     }
     return scope
-  }
-
-  /**
-   * Fixed-layout epubs must be advertised as EPUB3FL (Calibre-Web 4eaa9413)
-   *
-   * @param {Object} ebookFile
-   * @returns {Promise<string|null>}
-   */
-  async getLayout(ebookFile) {
-    const key = `${ebookFile.metadata.path}:${ebookFile.metadata.mtimeMs || ''}`
-    if (this.layoutCache.has(key)) return this.layoutCache.get(key)
-    let layout = null
-    try {
-      layout = await KepubManager.getEpubLayout(ebookFile.metadata.path)
-    } catch (error) {
-      Logger.warn(`[KoboSyncManager] Could not read layout of "${ebookFile.metadata.path}": ${error.message}`)
-    }
-    if (this.layoutCache.size > 5000) this.layoutCache.clear()
-    this.layoutCache.set(key, layout)
-    return layout
   }
 
   /**
@@ -185,7 +157,7 @@ class KoboSyncManager {
    * @param {string} deviceUrl
    * @param {import('../models/LibraryItem')} libraryItem
    * @param {'kepub'|'epub'} format
-   * @returns {Promise<{ urls: Object[], format: 'kepub'|'epub' }>}
+   * @returns {Promise<Object[]>}
    */
   async getDownloadUrls(deviceUrl, libraryItem, format) {
     const ebookFile = libraryItem.media.ebookFile
@@ -198,13 +170,9 @@ class KoboSyncManager {
       DrmType: 'None'
     })
 
-    if ((await this.getLayout(ebookFile)) === 'pre-paginated') {
-      return { urls: [entry('EPUB3FL', 'epub')], format: 'epub' }
-    }
-    if (format === 'kepub') {
-      return { urls: [entry('KEPUB', 'kepub')], format: 'kepub' }
-    }
-    return { urls: [entry('EPUB3', 'epub'), entry('EPUB', 'epub')], format: 'epub' }
+    if ((await KepubManager.getEpubLayout(ebookFile.metadata.path)) === 'pre-paginated') return [entry('EPUB3FL', 'epub')]
+    if (format === 'kepub') return [entry('KEPUB', 'kepub')]
+    return [entry('EPUB3', 'epub'), entry('EPUB', 'epub')]
   }
 
   /**
@@ -253,26 +221,32 @@ class KoboSyncManager {
 
     const results = []
     const entitledIds = new Set()
+    /** @type {Object[]} koboSyncedItem rows sent under this checkpoint */
+    const pendingRows = []
+    const addPending = (libraryItemId, version, format, removed) => {
+      pendingRows.push({ koboDeviceId: device.id, libraryItemId, pendingCheckpoint: checkpoint, pendingVersion: version, pendingFormat: format, pendingRemoved: removed, removedBy: null })
+    }
 
     // Entitlements
     const expandedItems = pageChanges.length ? await Database.libraryItemModel.findAllExpandedWhere({ id: pageChanges.map((change) => change.item.id) }) : []
     const expandedById = new Map(expandedItems.map((libraryItem) => [libraryItem.id, libraryItem]))
+    const progressAndStates = await KoboReadingStateManager.getProgressAndStates(user.id, expandedItems)
     for (const change of pageChanges) {
       const libraryItem = expandedById.get(change.item.id)
       if (!libraryItem) continue
       try {
-        const { urls, format } = await this.getDownloadUrls(deviceUrl, libraryItem, change.item.format)
+        const urls = await this.getDownloadUrls(deviceUrl, libraryItem, change.item.format)
         const entitlement = {
           BookEntitlement: buildBookEntitlement(libraryItem, { isRemoved: false }),
           BookMetadata: buildBookMetadata(libraryItem, { downloadUrls: urls, coverImageId: this.getCoverImageId(libraryItem.id, change.item.version) })
         }
-        const readingState = await KoboReadingStateManager.getReadingState(user, libraryItem)
+        const readingState = await KoboReadingStateManager.getReadingState(user, libraryItem, progressAndStates.get(libraryItem.id))
         if (readingState) entitlement.ReadingState = readingState
         results.push(change.isNew ? { NewEntitlement: entitlement } : { ChangedEntitlement: entitlement })
         entitledIds.add(libraryItem.id)
-        await this.markPending(device, rowsById.get(libraryItem.id), libraryItem.id, checkpoint, { version: change.item.version, format, removed: false })
+        addPending(libraryItem.id, change.item.version, change.item.format, false)
       } catch (error) {
-        // One bad book never fails the whole sync (Calibre-Web lesson 12)
+        // One bad book never fails the whole sync
         Logger.error(`[KoboSyncManager] Skipping "${libraryItem.media?.title}" (${libraryItem.id}) in sync: ${error.message}`)
       }
     }
@@ -286,7 +260,7 @@ class KoboSyncManager {
         let entitlement = buildRemovedEntitlement(row.libraryItemId)
         if (libraryItem?.media?.ebookFile) {
           try {
-            const { urls } = await this.getDownloadUrls(deviceUrl, libraryItem, row.deliveredFormat || 'epub')
+            const urls = await this.getDownloadUrls(deviceUrl, libraryItem, row.deliveredFormat || 'epub')
             entitlement = {
               BookEntitlement: buildBookEntitlement(libraryItem, { isRemoved: true }),
               BookMetadata: buildBookMetadata(libraryItem, { downloadUrls: urls, coverImageId: this.getCoverImageId(libraryItem.id, this.getItemVersion(libraryItem)) })
@@ -296,16 +270,17 @@ class KoboSyncManager {
           }
         }
         results.push({ ChangedEntitlement: entitlement })
-        await this.markPending(device, row, row.libraryItemId, checkpoint, { version: row.deliveredVersion, format: row.deliveredFormat, removed: true })
+        addPending(row.libraryItemId, row.deliveredVersion, row.deliveredFormat, true)
       }
     }
+    await Database.koboSyncedItemModel.bulkCreate(pendingRows, { updateOnDuplicate: ['pendingCheckpoint', 'pendingVersion', 'pendingFormat', 'pendingRemoved', 'removedBy'] })
 
     // Reading states changed since the last sync, for books the device holds
-    const heldIds = [...scope.keys()].filter((id) => {
-      const row = rowsById.get(id)
-      return (row?.deliveredAt && !row.isRemoved) || entitledIds.has(id)
+    const heldItems = [...scope.items.values()].filter((item) => {
+      const row = rowsById.get(item.id)
+      return (row?.deliveredAt && !row.isRemoved) || entitledIds.has(item.id)
     })
-    const readingStates = await KoboReadingStateManager.getChangedReadingStates(user, heldIds, token.readingStateLastModified, entitledIds, SYNC_ITEM_LIMIT)
+    const readingStates = await KoboReadingStateManager.getChangedReadingStates(user, heldItems, token.readingStateLastModified, entitledIds, SYNC_ITEM_LIMIT)
     for (const state of readingStates.states) {
       results.push({ ChangedReadingState: { ReadingState: state } })
     }
@@ -313,7 +288,7 @@ class KoboSyncManager {
     token.readingStateLastModified = Math.max(token.readingStateLastModified, readingStates.lastModified)
 
     // Collections, not paginated (Calibre-Web behavior)
-    results.push(...(await this.getTagChanges(user, device, scope, checkpoint)))
+    results.push(...(await this.getTagChanges(device, scope, checkpoint)))
 
     token.checkpoint = checkpoint
     const headers = {}
@@ -330,7 +305,7 @@ class KoboSyncManager {
     if (hasMore) headers['x-kobo-sync'] = 'continue'
     headers['x-kobo-synctoken'] = buildSyncToken(token)
 
-    await device.update({ lastSyncAt: new Date(), lastIp: req.ip || null, lastUserAgent: req.get('user-agent') || null })
+    await device.update({ lastSyncAt: new Date() })
     Logger.info(`[KoboSyncManager] Sync for "${user.username}" device "${device.name}": ${entitledIds.size} books, ${pageRemovals.length} removals, ${readingStates.states.length} reading states${hasMore ? ', more to come' : ''}`)
     return { results, token, headers }
   }
@@ -338,18 +313,18 @@ class KoboSyncManager {
   /**
    * What this device is missing: new or changed items in order of change, then removals
    *
-   * @param {Map<string, ScopeItem>} scope
+   * @param {Scope} scope
    * @param {Map<string, import('../models/KoboSyncedItem')>} rowsById
    * @returns {{ changes: { item: ScopeItem, isNew: boolean }[], removals: import('../models/KoboSyncedItem')[] }}
    */
   getPendingChanges(scope, rowsById) {
     const changes = []
-    for (const item of scope.values()) {
+    for (const item of scope.items.values()) {
       const row = rowsById.get(item.id)
       if (!row || !row.deliveredAt) {
         changes.push({ item, isNew: true })
       } else if (row.isRemoved) {
-        // Deleted on the Kobo: stays off this device until a resync (design §12.2).
+        // Deleted on the Kobo: stays off this device until a resync.
         // Left the scope and came back: the device no longer has it, so it is new again.
         if (row.removedBy !== 'device') changes.push({ item, isNew: true })
       } else if (item.version > Number(row.deliveredVersion || 0) || item.format !== row.deliveredFormat) {
@@ -360,7 +335,7 @@ class KoboSyncManager {
 
     const removals = []
     for (const row of rowsById.values()) {
-      if (!row.deliveredAt || row.isRemoved || scope.has(row.libraryItemId)) continue
+      if (!row.deliveredAt || row.isRemoved || scope.items.has(row.libraryItemId) || scope.missingIds.has(row.libraryItemId)) continue
       removals.push(row)
     }
     removals.sort((a, b) => a.libraryItemId.localeCompare(b.libraryItemId))
@@ -368,79 +343,49 @@ class KoboSyncManager {
   }
 
   /**
-   * Record a change as sent under a checkpoint, not yet delivered
-   *
-   * @param {import('../models/KoboDevice')} device
-   * @param {import('../models/KoboSyncedItem')|undefined} row
-   * @param {string} libraryItemId
-   * @param {string} checkpoint
-   * @param {{ version: number, format: string, removed: boolean }} pending
-   */
-  async markPending(device, row, libraryItemId, checkpoint, pending) {
-    const values = {
-      pendingCheckpoint: checkpoint,
-      pendingVersion: pending.version,
-      pendingFormat: pending.format,
-      pendingRemoved: pending.removed
-    }
-    if (row) {
-      if (!pending.removed && row.isRemoved) values.removedBy = null
-      await row.update(values)
-    } else {
-      await Database.koboSyncedItemModel.create({ koboDeviceId: device.id, libraryItemId, ...values })
-    }
-  }
-
-  /**
    * NewTag, ChangedTag and DeletedTag for the collections this device syncs
    *
-   * @param {import('../models/User')} user
    * @param {import('../models/KoboDevice')} device
-   * @param {Map<string, ScopeItem>} scope
+   * @param {Scope} scope
    * @param {string} checkpoint
    * @returns {Promise<Object[]>}
    */
-  async getTagChanges(user, device, scope, checkpoint) {
-    const libraryIds = scope.libraryIds || []
-    const where = { libraryId: libraryIds }
-    if (device.onlyCollections) where.id = Array.isArray(device.collectionIds) ? device.collectionIds : []
-    const collections = libraryIds.length ? await Database.collectionModel.findAll({ where, order: [['createdAt', 'ASC']] }) : []
+  async getTagChanges(device, scope, checkpoint) {
+    const where = { libraryId: scope.libraryIds }
+    if (device.onlyCollections) where.id = device.collectionIds || []
+    const collections = await Database.collectionModel.findAll({ where, order: [['createdAt', 'ASC']] })
 
-    const mediaIdToItemId = new Map([...scope.values()].map((item) => [item.mediaId, item.id]))
-    const collectionBooks = collections.length
-      ? await Database.collectionBookModel.findAll({ attributes: ['collectionId', 'bookId', 'order'], where: { collectionId: collections.map((collection) => collection.id) }, order: [['order', 'ASC']] })
-      : []
-    /** @type {Map<string, string[]>} */
-    const itemIdsByCollection = new Map()
+    const mediaIdToItemId = new Map([...scope.items.values()].map((item) => [item.mediaId, item.id]))
+    const collectionBooks = await Database.collectionBookModel.findAll({ attributes: ['collectionId', 'bookId'], where: { collectionId: collections.map((collection) => collection.id) }, order: [['order', 'ASC']] })
+    /** @type {Map<string, string[]>} collectionId -> library item ids */
+    const itemIdsByCollection = new Map(collections.map((collection) => [collection.id, []]))
     for (const collectionBook of collectionBooks) {
       const itemId = mediaIdToItemId.get(collectionBook.bookId)
-      if (!itemId) continue
-      if (!itemIdsByCollection.has(collectionBook.collectionId)) itemIdsByCollection.set(collectionBook.collectionId, [])
-      itemIdsByCollection.get(collectionBook.collectionId).push(itemId)
+      if (itemId) itemIdsByCollection.get(collectionBook.collectionId).push(itemId)
     }
 
     const rows = await Database.koboSyncedCollectionModel.findAll({ where: { koboDeviceId: device.id } })
     const rowsById = new Map(rows.map((row) => [row.collectionId, row]))
     const results = []
+    const pendingRows = []
+    const addPending = (collectionId, hash, deleted) => pendingRows.push({ koboDeviceId: device.id, collectionId, pendingCheckpoint: checkpoint, pendingHash: hash, pendingDeleted: deleted })
 
     for (const collection of collections) {
-      const itemIds = itemIdsByCollection.get(collection.id) || []
+      const itemIds = itemIdsByCollection.get(collection.id)
       const hash = crypto.createHash('sha1').update(JSON.stringify([collection.name, itemIds])).digest('hex')
       const row = rowsById.get(collection.id)
-      const isNew = !row || !row.deliveredHash || row.isDeleted
+      const isNew = !row?.deliveredHash || row.isDeleted
       if (!isNew && row.deliveredHash === hash) continue
-      results.push(isNew ? { NewTag: buildTag(collection, itemIds) } : { ChangedTag: buildTag(collection, itemIds) })
-      const values = { pendingCheckpoint: checkpoint, pendingHash: hash, pendingDeleted: false }
-      if (row) await row.update(values)
-      else await Database.koboSyncedCollectionModel.create({ koboDeviceId: device.id, collectionId: collection.id, ...values })
+      results.push({ [isNew ? 'NewTag' : 'ChangedTag']: buildTag(collection, itemIds) })
+      addPending(collection.id, hash, false)
     }
 
-    const currentIds = new Set(collections.map((collection) => collection.id))
     for (const row of rows) {
-      if (currentIds.has(row.collectionId) || row.isDeleted || !row.deliveredHash) continue
+      if (itemIdsByCollection.has(row.collectionId) || row.isDeleted || !row.deliveredHash) continue
       results.push({ DeletedTag: buildDeletedTag(row.collectionId) })
-      await row.update({ pendingCheckpoint: checkpoint, pendingHash: row.deliveredHash, pendingDeleted: true })
+      addPending(row.collectionId, row.deliveredHash, true)
     }
+    await Database.koboSyncedCollectionModel.bulkCreate(pendingRows, { updateOnDuplicate: ['pendingCheckpoint', 'pendingHash', 'pendingDeleted'] })
     return results
   }
 
@@ -456,7 +401,7 @@ class KoboSyncManager {
   }
 
   /**
-   * The device deleted a book: keep it off this device (design §12.2)
+   * The device deleted a book: keep it off this device until a resync
    *
    * @param {import('../models/KoboDevice')} device
    * @param {string} libraryItemId
@@ -475,18 +420,6 @@ class KoboSyncManager {
       pendingRemoved: null
     })
     return true
-  }
-
-  /**
-   * Whether this device has been sent the item (used to tell our books from store books)
-   *
-   * @param {import('../models/KoboDevice')} device
-   * @param {string} libraryItemId
-   * @returns {Promise<boolean>}
-   */
-  async isKnownItem(device, libraryItemId) {
-    const count = await Database.koboSyncedItemModel.count({ where: { koboDeviceId: device.id, libraryItemId, [Op.or]: [{ deliveredAt: { [Op.ne]: null } }, { pendingCheckpoint: { [Op.ne]: null } }] } })
-    return count > 0
   }
 }
 

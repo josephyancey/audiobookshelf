@@ -84,8 +84,6 @@ function buildSyncToken(token) {
 }
 
 module.exports = {
-  VERSION,
-  createSyncToken,
   parseSyncToken,
   buildSyncToken
 }

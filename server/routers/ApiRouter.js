@@ -187,15 +187,14 @@ class ApiRouter {
     this.router.patch('/me/progress/:libraryItemId/:episodeId?', MeController.createUpdateMediaProgress.bind(this))
     this.router.delete('/me/progress/:id', MeController.removeMediaProgress.bind(this))
     //
-    // Kobo Device Routes (handlers use their own controller instance)
+    // Kobo Device Routes
     //
-    const koboDevices = (method) => KoboDeviceController[method].bind(KoboDeviceController)
-    this.router.get('/me/kobo-devices', koboDevices('middleware'), koboDevices('findAll'))
-    this.router.post('/me/kobo-devices', koboDevices('middleware'), koboDevices('create'))
-    this.router.patch('/me/kobo-devices/:id', koboDevices('middleware'), koboDevices('update'))
-    this.router.delete('/me/kobo-devices/:id', koboDevices('middleware'), koboDevices('delete'))
-    this.router.post('/me/kobo-devices/:id/token', koboDevices('middleware'), koboDevices('regenerateToken'))
-    this.router.post('/me/kobo-devices/:id/resync', koboDevices('middleware'), koboDevices('resync'))
+    this.router.get('/me/kobo-devices', KoboDeviceController.middleware.bind(this), KoboDeviceController.findAll.bind(this))
+    this.router.post('/me/kobo-devices', KoboDeviceController.middleware.bind(this), KoboDeviceController.create.bind(this))
+    this.router.patch('/me/kobo-devices/:id', KoboDeviceController.middleware.bind(this), KoboDeviceController.update.bind(this))
+    this.router.delete('/me/kobo-devices/:id', KoboDeviceController.middleware.bind(this), KoboDeviceController.delete.bind(this))
+    this.router.post('/me/kobo-devices/:id/token', KoboDeviceController.middleware.bind(this), KoboDeviceController.regenerateToken.bind(this))
+    this.router.post('/me/kobo-devices/:id/resync', KoboDeviceController.middleware.bind(this), KoboDeviceController.resync.bind(this))
     this.router.post('/me/item/:id/bookmark', MeController.createBookmark.bind(this))
     this.router.patch('/me/item/:id/bookmark', MeController.updateBookmark.bind(this))
     this.router.delete('/me/item/:id/bookmark/:time', MeController.removeBookmark.bind(this))

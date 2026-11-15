@@ -13,6 +13,7 @@ const KoboCollectionManager = require('../managers/KoboCollectionManager')
 const NativeKoboResources = require('../utils/kobo/koboNativeResources')
 const { parseSyncToken } = require('../utils/kobo/syncToken')
 const { buildBookMetadata, koboTimestamp } = require('../utils/kobo/koboJson')
+const { isUUID } = require('../utils/index')
 
 /**
  * @typedef RequestKoboObject
@@ -30,22 +31,11 @@ const COVER_WIDTHS = [
 ]
 
 /**
- * Handlers for requests a Kobo makes to `/kobo/<token>/...` (docs/kobo-sync/design.md).
- * Behaviour and JSON shapes follow Calibre-Web's kobo.py (calibre-web-reference.md).
+ * Handlers for requests a Kobo makes to `/kobo/<token>/...`.
+ * Behaviour and JSON shapes follow Calibre-Web's kobo.py.
  */
 class KoboController {
   constructor() {}
-
-  /**
-   * Send JSON the way the device expects it: explicit utf-8 charset (Calibre-Web 7640ac1b)
-   *
-   * @param {Response} res
-   * @param {*} body
-   * @param {number} [status]
-   */
-  sendJson(res, body, status = 200) {
-    res.status(status).set('Content-Type', 'application/json; charset=utf-8').send(JSON.stringify(body))
-  }
 
   /**
    * A library item this device may be served, or null when it is not ours (a store book)
@@ -55,8 +45,8 @@ class KoboController {
    * @returns {Promise<import('../models/LibraryItem')|null>}
    */
   async getLibraryItem(req, libraryItemId) {
-    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(libraryItemId || '')) return null
-    const libraryItem = await Database.libraryItemModel.getExpandedById(libraryItemId)
+    if (!isUUID(libraryItemId)) return null
+    const [libraryItem] = await Database.libraryItemModel.findAllExpandedWhere({ id: libraryItemId })
     if (!libraryItem || libraryItem.mediaType !== 'book' || !libraryItem.media?.ebookFile) return null
     if (!req.user.checkCanAccessLibraryItem(libraryItem)) return null
     return libraryItem
@@ -94,13 +84,13 @@ class KoboController {
     resources.image_url_template = `${deviceUrl}/{ImageId}/{Width}/{Height}/false/image.jpg`
     resources.image_url_quality_template = `${deviceUrl}/{ImageId}/{Width}/{Height}/{Quality}/{IsGreyscale}/image.jpg`
     if (!KoboStoreProxy.isEnabled) {
-      // No Kobo account to fall back on: answer OAuth and reading services ourselves (design §10)
+      // No Kobo account to fall back on: answer OAuth and reading services ourselves
       resources.oauth_host = `${deviceUrl}/oauth`
       resources.reading_services_host = KoboSyncManager.getBaseUrl(req)
     }
 
     res.set('x-kobo-apitoken', 'e30=')
-    this.sendJson(res, { Resources: resources })
+    res.json({ Resources: resources })
   }
 
   /**
@@ -111,7 +101,7 @@ class KoboController {
    */
   sendDummyAuth(req, res) {
     const body = req.body && typeof req.body === 'object' ? req.body : {}
-    this.sendJson(res, {
+    res.json({
       AccessToken: crypto.randomBytes(24).toString('base64'),
       RefreshToken: crypto.randomBytes(24).toString('base64'),
       TokenType: 'Bearer',
@@ -141,7 +131,7 @@ class KoboController {
     const body = req.body && typeof req.body === 'object' ? req.body : {}
     const accessToken = crypto.randomBytes(24).toString('base64')
     const refreshToken = crypto.randomBytes(24).toString('base64')
-    this.sendJson(res, {
+    res.json({
       access_token: accessToken,
       refresh_token: refreshToken,
       token_type: 'Bearer',
@@ -163,7 +153,7 @@ class KoboController {
    */
   oauthDiscovery(req, res) {
     const issuer = `${KoboSyncManager.getDeviceUrl(req, req.params.token)}/oauth`
-    this.sendJson(res, {
+    res.json({
       issuer,
       authorization_endpoint: `${issuer}/auth`,
       token_endpoint: `${issuer}/token`,
@@ -190,14 +180,9 @@ class KoboController {
       return res.status(403).send('User does not have download permission')
     }
     const token = parseSyncToken(req.get('x-kobo-synctoken'))
-    try {
-      const { results, headers } = await KoboSyncManager.sync(req, req.user, req.koboDevice, token)
-      res.set(headers)
-      this.sendJson(res, results)
-    } catch (error) {
-      Logger.error(`[KoboController] Sync failed for device "${req.koboDevice.name}"`, error)
-      res.status(500).send('Sync failed')
-    }
+    const { results, headers } = await KoboSyncManager.sync(req, req.user, req.koboDevice, token)
+    res.set(headers)
+    res.json(results)
   }
 
   /**
@@ -210,9 +195,9 @@ class KoboController {
     const libraryItem = req.user.canDownload ? await this.getLibraryItem(req, req.params.itemId) : null
     if (!libraryItem) return KoboStoreProxy.redirectOrProxy(req, res)
     const scopeFormat = KoboSyncManager.getDeliveryFormat(libraryItem.media.ebookFile)
-    const { urls } = await KoboSyncManager.getDownloadUrls(KoboSyncManager.getDeviceUrl(req, req.params.token), libraryItem, scopeFormat)
+    const urls = await KoboSyncManager.getDownloadUrls(KoboSyncManager.getDeviceUrl(req, req.params.token), libraryItem, scopeFormat)
     const version = KoboSyncManager.getItemVersion(libraryItem)
-    this.sendJson(res, [buildBookMetadata(libraryItem, { downloadUrls: urls, coverImageId: KoboSyncManager.getCoverImageId(libraryItem.id, version) })])
+    res.json([buildBookMetadata(libraryItem, { downloadUrls: urls, coverImageId: KoboSyncManager.getCoverImageId(libraryItem.id, version) })])
   }
 
   /**
@@ -229,7 +214,7 @@ class KoboController {
       const now = koboTimestamp(Date.now())
       state = {
         EntitlementId: libraryItem.id,
-        Created: koboTimestamp(libraryItem.addedAt || libraryItem.createdAt),
+        Created: koboTimestamp(libraryItem.createdAt),
         LastModified: now,
         PriorityTimestamp: now,
         StatusInfo: { LastModified: now, Status: 'ReadyToRead', TimesStartedReading: 0 },
@@ -237,7 +222,7 @@ class KoboController {
         CurrentBookmark: { LastModified: now }
       }
     }
-    this.sendJson(res, [state])
+    res.json([state])
   }
 
   /**
@@ -263,12 +248,12 @@ class KoboController {
     if (incoming.CurrentBookmark) update.CurrentBookmarkResult = { Result: 'Success' }
     if (incoming.Statistics) update.StatisticsResult = { Result: 'Success' }
     if (incoming.StatusInfo) update.StatusInfoResult = { Result: 'Success' }
-    this.sendJson(res, { RequestResult: 'Success', UpdateResults: [update] })
+    res.json({ RequestResult: 'Success', UpdateResults: [update] })
   }
 
   /**
    * DELETE: /kobo/:token/v1/library/:itemId
-   * The user deleted the book on the Kobo: keep it off this device only (design §12.2)
+   * The user deleted the book on the Kobo: keep it off this device only
    *
    * @param {KoboRequest} req
    * @param {Response} res
@@ -292,32 +277,16 @@ class KoboController {
     if (!libraryItem) return res.sendStatus(404)
 
     const ebookPath = libraryItem.media.ebookFile.metadata.path
-    let filePath = ebookPath
-    let isKepub = false
-    if (req.params.format === 'kepub') {
-      const kepubPath = await KepubManager.getKepubPath(libraryItem)
-      if (kepubPath) {
-        filePath = kepubPath
-        isKepub = true
-      } else {
-        Logger.warn(`[KoboController] No kepub for "${libraryItem.media.title}", serving the epub`)
-      }
-    }
+    const kepubPath = req.params.format === 'kepub' ? await KepubManager.getKepubPath(libraryItem) : null
+    if (req.params.format === 'kepub' && !kepubPath) Logger.warn(`[KoboController] No kepub for "${libraryItem.media.title}", serving the epub`)
+    const filePath = kepubPath || ebookPath
     if (!(await fs.pathExists(filePath))) return res.sendStatus(404)
 
     // The Kobo picks its kepub renderer from the .kepub.epub name (Calibre-Web c2474aa9)
     const baseName = (libraryItem.media.title || Path.basename(ebookPath, Path.extname(ebookPath))).replace(/[\\/:*?"<>|]+/g, '_').trim() || libraryItem.id
-    const fileName = isKepub ? `${baseName}.kepub.epub` : `${baseName}.epub`
-    res.set('Content-Type', 'application/epub+zip')
-    res.attachment(fileName)
-    Logger.info(`[KoboController] Kobo "${req.koboDevice.name}" downloading "${libraryItem.media.title}" as ${isKepub ? 'kepub' : 'epub'}`)
-    try {
-      await new Promise((resolve, reject) => res.sendFile(filePath, { headers: { 'Content-Type': 'application/epub+zip' } }, (error) => (error ? reject(error) : resolve())))
-      if (isKepub) await KoboReadingStateManager.touchAfterDownload(req.user, libraryItem)
-    } catch (error) {
-      Logger.error(`[KoboController] Failed to send "${filePath}" to Kobo`, error)
-      if (!res.headersSent) res.sendStatus(500)
-    }
+    Logger.info(`[KoboController] Kobo "${req.koboDevice.name}" downloading "${libraryItem.media.title}" as ${kepubPath ? 'kepub' : 'epub'}`)
+    await new Promise((resolve, reject) => res.download(filePath, `${baseName}${kepubPath ? '.kepub' : ''}.epub`, (error) => (error ? reject(error) : resolve())))
+    if (kepubPath) await KoboReadingStateManager.touchAfterDownload(req.user, libraryItem)
   }
 
   /**
@@ -349,7 +318,7 @@ class KoboController {
    */
   async createTag(req, res) {
     const collectionId = await KoboCollectionManager.createFromDevice(req.user, req.koboDevice, req.body || {})
-    this.sendJson(res, collectionId, 201)
+    res.status(201).json(collectionId)
   }
 
   /**
@@ -361,7 +330,7 @@ class KoboController {
   async renameTag(req, res) {
     const collection = await KoboCollectionManager.getCollection(req.user, req.params.tagId)
     if (!collection) return KoboStoreProxy.isEnabled ? KoboStoreProxy.redirectOrProxy(req, res) : res.sendStatus(404)
-    await KoboCollectionManager.renameFromDevice(req.user, collection, req.body || {})
+    await KoboCollectionManager.renameFromDevice(req.user, req.koboDevice, collection, req.body || {})
     res.status(200).send(' ')
   }
 
@@ -386,8 +355,8 @@ class KoboController {
    */
   async addTagItems(req, res) {
     const collection = await KoboCollectionManager.getCollection(req.user, req.params.tagId)
-    if (!collection) return res.sendStatus(404)
-    await KoboCollectionManager.updateItemsFromDevice(req.user, collection, req.body?.Items, false)
+    // Also for a collection the device made without permission: a 404 can stall its queue
+    if (collection) await KoboCollectionManager.updateItemsFromDevice(req.user, req.koboDevice, collection, req.body?.Items, false)
     res.status(201).send('')
   }
 
@@ -399,14 +368,13 @@ class KoboController {
    */
   async removeTagItems(req, res) {
     const collection = await KoboCollectionManager.getCollection(req.user, req.params.tagId)
-    if (!collection) return res.sendStatus(404)
-    await KoboCollectionManager.updateItemsFromDevice(req.user, collection, req.body?.Items, true)
+    if (collection) await KoboCollectionManager.updateItemsFromDevice(req.user, req.koboDevice, collection, req.body?.Items, true)
     res.status(200).send('')
   }
 
   /**
    * Anything else the device asks for. A 404 on an unexpected endpoint can make the device
-   * abort its whole sync queue (Calibre-Web lesson 13), so never answer one.
+   * abort its whole sync queue, so never answer one.
    *
    * @param {KoboRequest} req
    * @param {Response} res

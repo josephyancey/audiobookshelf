@@ -1,3 +1,4 @@
+const crypto = require('crypto')
 const Logger = require('../Logger')
 const Database = require('../Database')
 const SocketAuthority = require('../SocketAuthority')
@@ -5,13 +6,25 @@ const RssFeedManager = require('./RssFeedManager')
 const htmlSanitizer = require('../utils/htmlSanitizer')
 
 /**
- * Collection edits made on a Kobo (design §12.1): applied to the ABS collection when the user
- * has permission, otherwise accepted and ignored so the device does not retry or abort.
- * Creating, renaming and adding/removing books need update permission; deleting needs delete
- * permission. Socket events match CollectionController so open web clients refresh.
+ * Collection edits made on a Kobo: applied to the ABS collection when the user has permission,
+ * otherwise accepted and ignored so the device does not retry or abort. Creating, renaming and
+ * adding/removing books need update permission; deleting needs delete permission. Socket events
+ * match CollectionController so open web clients refresh.
  */
 class KoboCollectionManager {
   constructor() {}
+
+  /**
+   * @param {import('../models/User')} user
+   * @param {import('../models/KoboDevice')} device
+   * @param {'canUpdate'|'canDelete'} permission
+   * @param {string} edit for the log
+   * @returns {boolean}
+   */
+  isAllowed(user, device, permission, edit) {
+    if (!user[permission]) Logger.info(`[KoboCollectionManager] Ignoring ${edit} from Kobo "${device.name}": "${user.username}" lacks the permission`)
+    return !!user[permission]
+  }
 
   /**
    * @param {import('../models/Collection')} collection
@@ -35,8 +48,7 @@ class KoboCollectionManager {
    */
   async getCollection(user, collectionId) {
     const collection = await Database.collectionModel.findByPk(collectionId)
-    if (!collection || !user.checkCanAccessLibrary(collection.libraryId)) return null
-    return collection
+    return collection && user.checkCanAccessLibrary(collection.libraryId) ? collection : null
   }
 
   /**
@@ -58,7 +70,8 @@ class KoboCollectionManager {
   }
 
   /**
-   * POST /v1/library/tags
+   * POST /v1/library/tags. A collection belongs to one library: that of its first book, else
+   * the first library the device syncs.
    *
    * @param {import('../models/User')} user
    * @param {import('../models/KoboDevice')} device
@@ -66,28 +79,25 @@ class KoboCollectionManager {
    * @returns {Promise<string>} id the device should use for the new collection
    */
   async createFromDevice(user, device, body) {
-    const name = htmlSanitizer.stripAllTags(body?.Name || '').trim()
-    if (!user.canUpdate || !name) {
-      Logger.info(`[KoboCollectionManager] Ignoring collection "${name}" created on Kobo "${device.name}" by "${user.username}" (no update permission or no name)`)
-      return require('crypto').randomUUID()
-    }
+    const name = htmlSanitizer.stripAllTags(body.Name || '').trim()
+    if (!name || !this.isAllowed(user, device, 'canUpdate', `new collection "${name}"`)) return crypto.randomUUID()
+
     const libraryItems = await this.getLibraryItems(user, body.Items)
     let libraryId = libraryItems[0]?.libraryId
     if (!libraryId) {
-      const libraries = await Database.libraryModel.findAll({ attributes: ['id', 'mediaType', 'displayOrder'], order: [['displayOrder', 'ASC']] })
-      libraryId = device.getLibraryIdsToSync(
-        user,
-        libraries.filter((library) => library.mediaType === 'book').map((library) => library.id)
-      )[0]
+      const libraries = await Database.libraryModel.findAll({ attributes: ['id'], where: { mediaType: 'book' }, order: [['displayOrder', 'ASC']] })
+      libraryId = device.getLibraryIdsToSync(user, libraries.map((library) => library.id))[0]
     }
-    if (!libraryId) return require('crypto').randomUUID()
+    if (!libraryId) return crypto.randomUUID()
 
-    const collection = await Database.collectionModel.create({ libraryId, name, description: null })
-    let order = 1
-    for (const libraryItem of libraryItems.filter((item) => item.libraryId === libraryId)) {
-      await Database.collectionBookModel.create({ collectionId: collection.id, bookId: libraryItem.mediaId, order: order++ })
-    }
-    Logger.info(`[KoboCollectionManager] Kobo "${device.name}" created collection "${name}" with ${order - 1} books`)
+    const books = libraryItems.filter((libraryItem) => libraryItem.libraryId === libraryId)
+    const collection = await Database.sequelize.transaction(async (transaction) => {
+      const newCollection = await Database.collectionModel.create({ libraryId, name }, { transaction })
+      const collectionBooks = books.map((libraryItem, index) => ({ collectionId: newCollection.id, bookId: libraryItem.mediaId, order: index + 1 }))
+      await Database.collectionBookModel.bulkCreate(collectionBooks, { transaction })
+      return newCollection
+    })
+    Logger.info(`[KoboCollectionManager] Kobo "${device.name}" created collection "${name}" with ${books.length} books`)
     await this.emit(collection, user, 'collection_added')
     return collection.id
   }
@@ -96,15 +106,13 @@ class KoboCollectionManager {
    * PUT /v1/library/tags/<id>
    *
    * @param {import('../models/User')} user
+   * @param {import('../models/KoboDevice')} device
    * @param {import('../models/Collection')} collection
    * @param {{ Name?: string }} body
    */
-  async renameFromDevice(user, collection, body) {
-    const name = htmlSanitizer.stripAllTags(body?.Name || '').trim()
-    if (!user.canUpdate || !name || name === collection.name) {
-      if (name && name !== collection.name) Logger.info(`[KoboCollectionManager] Ignoring rename of "${collection.name}" from Kobo: "${user.username}" has no update permission`)
-      return
-    }
+  async renameFromDevice(user, device, collection, body) {
+    const name = htmlSanitizer.stripAllTags(body.Name || '').trim()
+    if (!name || name === collection.name || !this.isAllowed(user, device, 'canUpdate', `rename of "${collection.name}"`)) return
     await collection.update({ name })
     await this.emit(collection, user, 'collection_updated')
   }
@@ -117,10 +125,7 @@ class KoboCollectionManager {
    * @param {import('../models/Collection')} collection
    */
   async deleteFromDevice(user, device, collection) {
-    if (!user.canDelete) {
-      Logger.info(`[KoboCollectionManager] Ignoring delete of collection "${collection.name}" from Kobo: "${user.username}" has no delete permission`)
-      return
-    }
+    if (!this.isAllowed(user, device, 'canDelete', `delete of "${collection.name}"`)) return
     const jsonExpanded = await collection.getOldJsonExpanded(user)
     await RssFeedManager.closeFeedForEntityId(collection.id)
     await collection.destroy()
@@ -134,38 +139,32 @@ class KoboCollectionManager {
    * POST /v1/library/tags/<id>/items and .../items/delete
    *
    * @param {import('../models/User')} user
+   * @param {import('../models/KoboDevice')} device
    * @param {import('../models/Collection')} collection
    * @param {Object[]} items
    * @param {boolean} remove
    */
-  async updateItemsFromDevice(user, collection, items, remove) {
-    if (!user.canUpdate) {
-      Logger.info(`[KoboCollectionManager] Ignoring book changes to "${collection.name}" from Kobo: "${user.username}" has no update permission`)
-      return
-    }
-    const libraryItems = (await this.getLibraryItems(user, items)).filter((libraryItem) => libraryItem.libraryId === collection.libraryId)
-    if (!libraryItems.length) return
-    const mediaIds = new Set(libraryItems.map((libraryItem) => libraryItem.mediaId))
-    const collectionBooks = await collection.getCollectionBooks({ order: [['order', 'ASC']] })
+  async updateItemsFromDevice(user, device, collection, items, remove) {
+    if (!this.isAllowed(user, device, 'canUpdate', `book changes to "${collection.name}"`)) return
+    const libraryItems = await this.getLibraryItems(user, items)
+    const mediaIds = new Set(libraryItems.filter((libraryItem) => libraryItem.libraryId === collection.libraryId).map((libraryItem) => libraryItem.mediaId))
+    if (!mediaIds.size) return
 
-    if (remove) {
-      let order = 1
-      for (const collectionBook of collectionBooks) {
-        if (mediaIds.has(collectionBook.bookId)) {
-          await collectionBook.destroy()
-        } else {
-          if (collectionBook.order !== order) await collectionBook.update({ order })
-          order++
+    const collectionBooks = await collection.getCollectionBooks({ order: [['order', 'ASC']] })
+    await Database.sequelize.transaction(async (transaction) => {
+      if (remove) {
+        await Database.collectionBookModel.destroy({ where: { collectionId: collection.id, bookId: [...mediaIds] }, transaction })
+        const kept = collectionBooks.filter((collectionBook) => !mediaIds.has(collectionBook.bookId))
+        for (const [index, collectionBook] of kept.entries()) {
+          if (collectionBook.order !== index + 1) await collectionBook.update({ order: index + 1 }, { transaction })
         }
+      } else {
+        const existing = new Set(collectionBooks.map((collectionBook) => collectionBook.bookId))
+        const added = [...mediaIds].filter((mediaId) => !existing.has(mediaId))
+        const newBooks = added.map((bookId, index) => ({ collectionId: collection.id, bookId, order: collectionBooks.length + index + 1 }))
+        await Database.collectionBookModel.bulkCreate(newBooks, { transaction })
       }
-    } else {
-      const existing = new Set(collectionBooks.map((collectionBook) => collectionBook.bookId))
-      let order = collectionBooks.length + 1
-      for (const mediaId of mediaIds) {
-        if (existing.has(mediaId)) continue
-        await Database.collectionBookModel.create({ collectionId: collection.id, bookId: mediaId, order: order++ })
-      }
-    }
+    })
     await this.emit(collection, user, 'collection_updated')
   }
 }

@@ -35,18 +35,17 @@ class KoboSyncedCollection extends Model {
    * @returns {Promise<number>}
    */
   static async confirmCheckpoint(koboDeviceId, checkpoint) {
-    if (!checkpoint) return 0
-    const rows = await this.findAll({ where: { koboDeviceId, pendingCheckpoint: checkpoint } })
-    for (const row of rows) {
-      await row.update({
-        deliveredHash: row.pendingHash,
-        isDeleted: !!row.pendingDeleted,
+    const [count] = await this.update(
+      {
+        deliveredHash: this.sequelize.col('pendingHash'),
+        isDeleted: this.sequelize.col('pendingDeleted'),
         pendingCheckpoint: null,
         pendingHash: null,
         pendingDeleted: null
-      })
-    }
-    return rows.length
+      },
+      { where: { koboDeviceId, pendingCheckpoint: checkpoint } }
+    )
+    return count
   }
 
   /**

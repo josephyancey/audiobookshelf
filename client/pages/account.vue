@@ -502,79 +502,54 @@ export default {
       const index = this.koboDevices.findIndex((d) => d.id === device.id)
       if (index >= 0) this.koboDevices.splice(index, 1, device)
     },
-    resyncKoboDeviceClick(device) {
+    confirmKoboDeviceAction(device, messageKey, request, onSuccess, errorMessage) {
       this.$store.commit('globals/setConfirmPrompt', {
-        message: this.$getString('MessageConfirmKoboResync', [device.name]),
+        message: this.$getString(messageKey, [device.name]),
         callback: (confirmed) => {
-          if (confirmed) this.resyncKoboDevice(device)
+          if (!confirmed) return
+          this.processingKoboDeviceId = device.id
+          request()
+            .then(onSuccess)
+            .catch((error) => {
+              console.error('Kobo device request failed', error)
+              this.$toast.error(this.getRequestErrorMessage(error, errorMessage))
+            })
+            .finally(() => {
+              this.processingKoboDeviceId = null
+            })
         },
         type: 'yesNo'
       })
     },
-    resyncKoboDevice(device) {
-      this.processingKoboDeviceId = device.id
-      this.$axios
-        .$post(`/api/me/kobo-devices/${device.id}/resync`)
-        .then(() => {
-          this.$toast.success(this.$strings.ToastKoboResyncQueued)
-        })
-        .catch((error) => {
-          console.error('Failed to resync Kobo device', error)
-          this.$toast.error(this.getRequestErrorMessage(error, this.$strings.ToastFailedToUpdate))
-        })
-        .finally(() => {
-          this.processingKoboDeviceId = null
-        })
+    resyncKoboDeviceClick(device) {
+      const resync = () => this.$axios.$post(`/api/me/kobo-devices/${device.id}/resync`)
+      this.confirmKoboDeviceAction(device, 'MessageConfirmKoboResync', resync, () => this.$toast.success(this.$strings.ToastKoboResyncQueued), this.$strings.ToastFailedToUpdate)
     },
     regenerateKoboTokenClick(device) {
-      this.$store.commit('globals/setConfirmPrompt', {
-        message: this.$getString('MessageConfirmKoboNewSetupLine', [device.name]),
-        callback: (confirmed) => {
-          if (confirmed) this.regenerateKoboToken(device)
-        },
-        type: 'yesNo'
-      })
-    },
-    regenerateKoboToken(device) {
-      this.processingKoboDeviceId = device.id
-      this.$axios
-        .$post(`/api/me/kobo-devices/${device.id}/token`)
-        .then((data) => {
+      const regenerate = () => this.$axios.$post(`/api/me/kobo-devices/${device.id}/token`)
+      this.confirmKoboDeviceAction(
+        device,
+        'MessageConfirmKoboNewSetupLine',
+        regenerate,
+        (data) => {
           this.selectedKoboDevice = device
           this.koboApiEndpoint = data.apiEndpoint
           this.showKoboDeviceModal = true
-        })
-        .catch((error) => {
-          console.error('Failed to regenerate Kobo token', error)
-          this.$toast.error(this.getRequestErrorMessage(error, this.$strings.ToastFailedToUpdate))
-        })
-        .finally(() => {
-          this.processingKoboDeviceId = null
-        })
+        },
+        this.$strings.ToastFailedToUpdate
+      )
     },
     deleteKoboDeviceClick(device) {
-      this.$store.commit('globals/setConfirmPrompt', {
-        message: this.$getString('MessageConfirmDeleteKoboDevice', [device.name]),
-        callback: (confirmed) => {
-          if (confirmed) this.deleteKoboDevice(device)
-        },
-        type: 'yesNo'
-      })
-    },
-    deleteKoboDevice(device) {
-      this.processingKoboDeviceId = device.id
-      this.$axios
-        .$delete(`/api/me/kobo-devices/${device.id}`)
-        .then(() => {
+      const remove = () => this.$axios.$delete(`/api/me/kobo-devices/${device.id}`)
+      this.confirmKoboDeviceAction(
+        device,
+        'MessageConfirmDeleteKoboDevice',
+        remove,
+        () => {
           this.koboDevices = this.koboDevices.filter((d) => d.id !== device.id)
-        })
-        .catch((error) => {
-          console.error('Failed to delete Kobo device', error)
-          this.$toast.error(this.getRequestErrorMessage(error, this.$strings.ToastFailedToDelete))
-        })
-        .finally(() => {
-          this.processingKoboDeviceId = null
-        })
+        },
+        this.$strings.ToastFailedToDelete
+      )
     }
   },
   mounted() {

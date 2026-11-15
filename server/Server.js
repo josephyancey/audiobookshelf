@@ -345,7 +345,7 @@ class Server {
     // Skip JSON parsing for internal-api routes
     router.use(/^(?!\/internal-api).*/, express.json({ limit: '10mb' }))
 
-    // Kobo reading services hit the site root, ahead of the /api auth (design §10)
+    // Kobo reading services hit the site root, ahead of the /api auth
     router.use(KoboController.readingServicesStub.bind(KoboController))
     router.use('/api', this.auth.ifAuthNeeded(this.authMiddleware.bind(this)), this.apiRouter.router)
     router.use('/hls', this.hlsRouter.router)

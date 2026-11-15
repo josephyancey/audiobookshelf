@@ -27,7 +27,7 @@ class KoboSyncedItem extends Model {
     this.deliveredFormat
     /** @type {boolean} The device last confirmed a removal */
     this.isRemoved
-    /** @type {string} 'device' when the user deleted it on the Kobo, 'scope' when it left the sync scope */
+    /** @type {string} 'device' when the user deleted it on the Kobo (it then stays off until a resync) */
     this.removedBy
     /** @type {string} Checkpoint of the page carrying an unconfirmed change */
     this.pendingCheckpoint
@@ -50,23 +50,21 @@ class KoboSyncedItem extends Model {
    * @returns {Promise<number>} rows confirmed
    */
   static async confirmCheckpoint(koboDeviceId, checkpoint) {
-    if (!checkpoint) return 0
-    const rows = await this.findAll({ where: { koboDeviceId, pendingCheckpoint: checkpoint } })
-    for (const row of rows) {
-      const removed = !!row.pendingRemoved
-      await row.update({
-        deliveredAt: row.deliveredAt || new Date(),
-        deliveredVersion: row.pendingVersion,
-        deliveredFormat: row.pendingFormat,
-        isRemoved: removed,
-        removedBy: removed ? row.removedBy || 'scope' : null,
+    const where = { koboDeviceId, pendingCheckpoint: checkpoint }
+    await this.update({ deliveredAt: new Date() }, { where: { ...where, deliveredAt: null } })
+    const [count] = await this.update(
+      {
+        deliveredVersion: this.sequelize.col('pendingVersion'),
+        deliveredFormat: this.sequelize.col('pendingFormat'),
+        isRemoved: this.sequelize.col('pendingRemoved'),
         pendingCheckpoint: null,
         pendingVersion: null,
         pendingFormat: null,
         pendingRemoved: null
-      })
-    }
-    return rows.length
+      },
+      { where }
+    )
+    return count
   }
 
   /**

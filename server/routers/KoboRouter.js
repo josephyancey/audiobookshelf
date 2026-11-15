@@ -1,8 +1,8 @@
 const express = require('express')
-const { rateLimit } = require('express-rate-limit')
 const Logger = require('../Logger')
 const Database = require('../Database')
 const requestIp = require('../libs/requestIp')
+const RateLimiterFactory = require('../utils/rateLimiterFactory')
 const KoboController = require('../controllers/KoboController')
 
 /**
@@ -19,29 +19,6 @@ class KoboRouter {
   }
 
   /**
-   * Only failed token lookups count toward the limit. A real sync makes dozens of requests a
-   * minute, and Calibre-Web's blanket limit broke them (Calibre-Web lesson 32).
-   */
-  get rateLimiter() {
-    if (!this._rateLimiter) {
-      this._rateLimiter = rateLimit({
-        windowMs: 10 * 60 * 1000,
-        max: 40,
-        standardHeaders: true,
-        legacyHeaders: false,
-        requestWasSuccessful: (req, res) => res.statusCode !== 401,
-        skipSuccessfulRequests: true,
-        keyGenerator: (req) => requestIp.getClientIp(req) || req.ip,
-        handler: (req, res) => {
-          Logger.warn(`[KoboRouter] Too many failed Kobo token attempts from ${requestIp.getClientIp(req) || req.ip}`)
-          res.status(429).send('Too many requests')
-        }
-      })
-    }
-    return this._rateLimiter
-  }
-
-  /**
    * @param {import('express').Request} req
    * @param {import('express').Response} res
    * @param {import('express').NextFunction} next
@@ -55,6 +32,8 @@ class KoboRouter {
       const user = device ? await Database.userModel.getUserById(device.userId) : null
       if (!device || !user?.isActive) {
         Logger.warn(`[KoboRouter] Unknown Kobo token from ${requestIp.getClientIp(req) || req.ip}`)
+        // Only these count toward the rate limit, not 401s forwarded from the Kobo store
+        req.koboAuthFailed = true
         return res.sendStatus(401)
       }
       req.koboDevice = device
@@ -75,7 +54,7 @@ class KoboRouter {
         if (!res.headersSent) res.status(500).send('Internal error')
       })
 
-    this.router.use(this.rateLimiter, this.authMiddleware.bind(this))
+    this.router.use(RateLimiterFactory.getKoboRateLimiter(), this.authMiddleware.bind(this))
 
     this.router.get('/', handle('root'))
     this.router.get('/v1/initialization', handle('initialization'))

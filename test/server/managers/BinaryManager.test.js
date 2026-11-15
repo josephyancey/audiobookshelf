@@ -5,7 +5,7 @@ const fileUtils = require('../../../server/utils/fileUtils')
 const which = require('../../../server/libs/which')
 const path = require('path')
 const BinaryManager = require('../../../server/managers/BinaryManager')
-const { Binary, ffbinaries, kepubify } = require('../../../server/managers/BinaryManager')
+const { Binary, ffbinaries } = require('../../../server/managers/BinaryManager')
 
 const expect = chai.expect
 
@@ -558,117 +558,6 @@ describe('Binary', () => {
       expect(downloadBinaryStub.calledWith('libavcodec', '5.1', destination)).to.be.true
       expect(fsWriteFileStub.calledOnce).to.be.true
       expect(fsWriteFileStub.calledWith(versionFilePath, '5.1')).to.be.true
-    })
-  })
-})
-
-describe('kepubify', () => {
-  describe('default binaries', () => {
-    it('should include an optional kepubify executable', () => {
-      const binaryManager = new BinaryManager()
-      const kepubifyBinary = binaryManager.requiredBinaries.find((binary) => binary.name === 'kepubify')
-
-      expect(kepubifyBinary).to.exist
-      expect(kepubifyBinary.type).to.equal('executable')
-      expect(kepubifyBinary.envVariable).to.equal('KEPUBIFY_PATH')
-      expect(kepubifyBinary.required).to.be.false
-      expect(kepubifyBinary.source).to.equal(kepubify)
-      expect(kepubifyBinary.validVersions[0]).to.equal('4.0.4')
-      expect(binaryManager.requiredBinaries.filter((binary) => binary.required).map((binary) => binary.name)).to.deep.equal(['ffmpeg', 'ffprobe'])
-    })
-  })
-
-  describe('isGood', () => {
-    let binary
-    let fsPathExistsStub
-    let execStub
-    const binaryPath = '/path/to/kepubify'
-
-    beforeEach(() => {
-      binary = new BinaryManager().requiredBinaries.find((b) => b.name === 'kepubify')
-      fsPathExistsStub = sinon.stub(fs, 'pathExists').resolves(true)
-      execStub = sinon.stub(binary, 'exec')
-    })
-
-    afterEach(() => {
-      fsPathExistsStub.restore()
-      execStub.restore()
-    })
-
-    it('should check the version with --version', async () => {
-      execStub.resolves({ stdout: 'kepubify v4.0.4\n' })
-
-      const result = await binary.isGood(binaryPath)
-
-      expect(result).to.be.true
-      expect(execStub.calledOnceWith('"' + binaryPath + '"' + ' --version')).to.be.true
-    })
-
-    it('should reject other major versions', async () => {
-      execStub.resolves({ stdout: 'kepubify v5.0.0\n' })
-      expect(await binary.isGood(binaryPath)).to.be.false
-    })
-
-    it('should reject output without a kepubify version', async () => {
-      execStub.resolves({ stdout: 'ffmpeg version 4.0.4' })
-      expect(await binary.isGood(binaryPath)).to.be.false
-    })
-  })
-
-  describe('KepubifyDownloader', () => {
-    it('should build the GitHub release asset url', async () => {
-      const assetName = kepubify.getAssetName('kepubify', '4.0.4')
-      const url = await kepubify.getAssetUrl('4.0.4', assetName)
-
-      expect(assetName).to.equal(`kepubify-${kepubify.platformSuffix}`)
-      expect(url).to.equal(`https://github.com/pgaskin/kepubify/releases/download/v4.0.4/${assetName}`)
-    })
-
-    it('should map platforms to release asset suffixes', () => {
-      const originalPlatform = Object.getOwnPropertyDescriptor(process, 'platform')
-      const originalArch = Object.getOwnPropertyDescriptor(process, 'arch')
-      const mock = (platform, arch) => {
-        Object.defineProperty(process, 'platform', { value: platform })
-        Object.defineProperty(process, 'arch', { value: arch })
-      }
-      try {
-        mock('linux', 'x64')
-        expect(kepubify.getPlatformSuffix()).to.equal('linux-64bit')
-        mock('linux', 'arm64')
-        expect(kepubify.getPlatformSuffix()).to.equal('linux-arm64')
-        mock('win32', 'x64')
-        expect(kepubify.getPlatformSuffix()).to.equal('windows-64bit.exe')
-        mock('darwin', 'arm64')
-        expect(kepubify.getPlatformSuffix()).to.equal('darwin-arm64')
-        mock('sunos', 'x64')
-        expect(kepubify.getPlatformSuffix()).to.be.null
-      } finally {
-        Object.defineProperty(process, 'platform', originalPlatform)
-        Object.defineProperty(process, 'arch', originalArch)
-      }
-    })
-
-    it('should download the plain executable into the destination', async () => {
-      const destDir = fs.mkdtempSync(path.join(require('os').tmpdir(), 'kepubify-dl-'))
-      const downloadAssetStub = sinon.stub(kepubify, 'downloadAsset').callsFake(async (assetUrl, dir) => {
-        const tempPath = path.join(dir, 'temp.zip')
-        await fs.writeFile(tempPath, 'binary')
-        return tempPath
-      })
-      try {
-        await kepubify.downloadBinary('kepubify', '4.0.4', destDir)
-
-        const fileName = kepubify.getAssetFileName('kepubify')
-        expect(downloadAssetStub.calledOnce).to.be.true
-        expect(downloadAssetStub.firstCall.args[0]).to.equal(`https://github.com/pgaskin/kepubify/releases/download/v4.0.4/kepubify-${kepubify.platformSuffix}`)
-        expect(fs.readdirSync(destDir)).to.deep.equal([fileName])
-        if (process.platform !== 'win32') {
-          expect(fs.statSync(path.join(destDir, fileName)).mode & 0o777).to.equal(0o755)
-        }
-      } finally {
-        downloadAssetStub.restore()
-        fs.rmSync(destDir, { recursive: true, force: true })
-      }
     })
   })
 })

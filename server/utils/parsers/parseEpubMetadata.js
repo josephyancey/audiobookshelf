@@ -36,6 +36,7 @@ async function extractXmlToJson(epubPath, xmlFilepath) {
   if (!filedata) return null
   return xmlToJSON(filedata)
 }
+module.exports.extractXmlToJson = extractXmlToJson
 
 /**
  * Extract cover image from epub return true if success
