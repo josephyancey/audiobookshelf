@@ -101,6 +101,11 @@ export default {
           path: '/config/email'
         },
         {
+          id: 'config-kobo',
+          title: this.$strings.HeaderKoboSync,
+          path: '/config/kobo'
+        },
+        {
           id: 'config-item-metadata-utils',
           title: this.$strings.HeaderItemMetadataUtils,
           path: '/config/item-metadata-utils'

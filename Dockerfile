@@ -1,5 +1,7 @@
 ARG NUSQLITE3_DIR="/usr/local/lib/nusqlite3"
 ARG NUSQLITE3_PATH="${NUSQLITE3_DIR}/libnusqlite3.so"
+ARG KEPUBIFY_VERSION="v4.0.4"
+ARG KEPUBIFY_PATH="/usr/local/bin/kepubify"
 
 ### STAGE 0: Build client ###
 FROM node:24-alpine AS build-client
@@ -21,6 +23,8 @@ RUN npm ci --include=dev --ignore-scripts && npm run build:server
 FROM node:24-alpine AS build-server
 
 ARG NUSQLITE3_DIR
+ARG KEPUBIFY_VERSION
+ARG KEPUBIFY_PATH
 ARG TARGETPLATFORM
 
 ENV NODE_ENV=production
@@ -47,6 +51,15 @@ RUN case "$TARGETPLATFORM" in \
   unzip /tmp/library.zip -d $NUSQLITE3_DIR && \
   rm /tmp/library.zip
 
+RUN case "$TARGETPLATFORM" in \
+  "linux/amd64") \
+  curl -fL -o $KEPUBIFY_PATH "https://github.com/pgaskin/kepubify/releases/download/${KEPUBIFY_VERSION}/kepubify-linux-64bit" ;; \
+  "linux/arm64") \
+  curl -fL -o $KEPUBIFY_PATH "https://github.com/pgaskin/kepubify/releases/download/${KEPUBIFY_VERSION}/kepubify-linux-arm64" ;; \
+  *) echo "Unsupported platform: $TARGETPLATFORM" && exit 1 ;; \
+  esac && \
+  chmod +x $KEPUBIFY_PATH
+
 RUN npm ci --omit=dev
 
 ### STAGE 3: Create minimal runtime image ###
@@ -54,6 +67,7 @@ FROM node:24-alpine
 
 ARG NUSQLITE3_DIR
 ARG NUSQLITE3_PATH
+ARG KEPUBIFY_PATH
 
 # Install only runtime dependencies
 RUN apk add --no-cache --update \
@@ -67,6 +81,7 @@ WORKDIR /app
 COPY --from=build-client /client/dist /app/client/dist
 COPY --from=build-server /server /app
 COPY --from=build-server ${NUSQLITE3_PATH} ${NUSQLITE3_PATH}
+COPY --from=build-server ${KEPUBIFY_PATH} ${KEPUBIFY_PATH}
 
 EXPOSE 80
 
@@ -77,6 +92,7 @@ ENV METADATA_PATH="/metadata"
 ENV SOURCE="docker"
 ENV NUSQLITE3_DIR=${NUSQLITE3_DIR}
 ENV NUSQLITE3_PATH=${NUSQLITE3_PATH}
+ENV KEPUBIFY_PATH=${KEPUBIFY_PATH}
 
 ENTRYPOINT ["tini", "--"]
 CMD ["node", "dist-server/index.js"]

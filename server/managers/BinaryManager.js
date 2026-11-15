@@ -219,8 +219,95 @@ class NunicodeDownloader extends ZippedAssetDownloader {
   }
 }
 
+class KepubifyDownloader extends ZippedAssetDownloader {
+  constructor() {
+    super()
+    this.platformSuffix = this.getPlatformSuffix()
+  }
+
+  /**
+   * Suffix of the kepubify release asset for this platform (assets are plain executables, not zipped)
+   *
+   * @returns {string|null}
+   */
+  getPlatformSuffix() {
+    const platform = process.platform
+    const arch = process.arch
+
+    if (platform === 'win32') {
+      if (arch === 'x64') return 'windows-64bit.exe'
+      if (arch === 'arm64') return 'windows-arm64.exe'
+      if (arch === 'ia32') return 'windows-32bit.exe'
+    } else if (platform === 'darwin') {
+      if (arch === 'x64') return 'darwin-64bit'
+      if (arch === 'arm64') return 'darwin-arm64'
+    } else if (platform === 'linux') {
+      if (arch === 'x64') return 'linux-64bit'
+      if (arch === 'arm64') return 'linux-arm64'
+      if (arch === 'arm') return 'linux-arm'
+      if (arch === 'ia32') return 'linux-32bit'
+    }
+
+    return null
+  }
+
+  async getAssetUrl(releaseTag, assetName) {
+    return `https://github.com/pgaskin/kepubify/releases/download/v${releaseTag}/${assetName}`
+  }
+
+  getAssetName(binaryName, releaseTag) {
+    if (!this.platformSuffix) {
+      throw new Error(`[KepubifyDownloader] Platform ${process.platform}-${process.arch} not supported`)
+    }
+    return `${binaryName}-${this.platformSuffix}`
+  }
+
+  getAssetFileName(binaryName) {
+    return process.platform === 'win32' ? `${binaryName}.exe` : binaryName
+  }
+
+  /**
+   * Download the executable directly (kepubify release assets are not zipped)
+   *
+   * @param {string} binaryName
+   * @param {string} releaseTag
+   * @param {string} destDir
+   */
+  async downloadBinary(binaryName, releaseTag, destDir) {
+    let downloadPath
+    try {
+      await fs.ensureDir(destDir)
+      const assetName = this.getAssetName(binaryName, releaseTag)
+      const assetUrl = await this.getAssetUrl(releaseTag, assetName)
+      downloadPath = await this.downloadAsset(assetUrl, destDir)
+      const outputPath = path.join(destDir, this.getAssetFileName(binaryName))
+      await fs.move(downloadPath, outputPath, { overwrite: true })
+      downloadPath = null
+      if (process.platform !== 'win32') {
+        await fs.chmod(outputPath, 0o755)
+      }
+      Logger.debug(`[KepubifyDownloader] Downloaded ${assetUrl} to ${outputPath}`)
+    } catch (error) {
+      Logger.error(`[KepubifyDownloader] Error downloading ${binaryName}: ${error.message}`)
+    } finally {
+      if (downloadPath) await fs.remove(downloadPath).catch(() => {})
+    }
+  }
+}
+
 class Binary {
-  constructor(name, type, envVariable, validVersions, source, required = true) {
+  /**
+   * @param {string} name
+   * @param {string} type 'executable' or 'library'
+   * @param {string} envVariable
+   * @param {string[]} validVersions first one is the version downloaded
+   * @param {ZippedAssetDownloader} source
+   * @param {boolean} [required=true]
+   * @param {Object} [options]
+   * @param {string} [options.versionArg='-version'] argument that makes the executable print its version
+   * @param {RegExp} [options.versionRegex] regex with the version number as first capture group
+   */
+  constructor(name, type, envVariable, validVersions, source, required = true, options = {}) {
     if (!name) throw new Error('Binary name is required')
     this.name = name
     if (!type) throw new Error('Binary type is required')
@@ -233,6 +320,8 @@ class Binary {
     this.source = source
     this.fileName = this.getFileName()
     this.required = required
+    this.versionArg = options.versionArg || '-version'
+    this.versionRegex = options.versionRegex || /version\s([\d\.]+)/
     this.exec = exec
   }
 
@@ -280,8 +369,8 @@ class Binary {
 
   async isExecutableVersionValid(executablePath) {
     try {
-      const { stdout } = await this.exec('"' + executablePath + '"' + ' -version')
-      const version = stdout.match(/version\s([\d\.]+)/)?.[1]
+      const { stdout } = await this.exec('"' + executablePath + '"' + ' ' + this.versionArg)
+      const version = stdout.match(this.versionRegex)?.[1]
       if (!version) return false
       return this.validVersions.some((validVersion) => version.startsWith(validVersion))
     } catch (err) {
@@ -319,12 +408,14 @@ class Binary {
 
 const ffbinaries = new FFBinariesDownloader()
 const nunicode = new NunicodeDownloader()
+const kepubify = new KepubifyDownloader()
 
 class BinaryManager {
   defaultRequiredBinaries = [
     new Binary('ffmpeg', 'executable', 'FFMPEG_PATH', ['5.1'], ffbinaries), // ffmpeg executable
     new Binary('ffprobe', 'executable', 'FFPROBE_PATH', ['5.1'], ffbinaries), // ffprobe executable
-    new Binary('libnusqlite3', 'library', 'NUSQLITE3_PATH', ['1.2'], nunicode, false) // nunicode sqlite3 extension
+    new Binary('libnusqlite3', 'library', 'NUSQLITE3_PATH', ['1.2'], nunicode, false), // nunicode sqlite3 extension
+    new Binary('kepubify', 'executable', 'KEPUBIFY_PATH', ['4.0.4', '4.0'], kepubify, false, { versionArg: '--version', versionRegex: /kepubify\sv([\d\.]+)/ }) // kepubify (optional, for Kobo sync KEPUB conversion)
   ]
 
   constructor(requiredBinaries = this.defaultRequiredBinaries) {
@@ -435,3 +526,4 @@ module.exports = BinaryManager
 module.exports.Binary = Binary // for testing
 module.exports.ffbinaries = ffbinaries // for testing
 module.exports.nunicode = nunicode // for testing
+module.exports.kepubify = kepubify // for testing

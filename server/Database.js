@@ -52,6 +52,26 @@ class Database {
     return this.models.apiKey
   }
 
+  /** @type {typeof import('./models/KoboDevice')} */
+  get koboDeviceModel() {
+    return this.models.koboDevice
+  }
+
+  /** @type {typeof import('./models/KoboSyncedItem')} */
+  get koboSyncedItemModel() {
+    return this.models.koboSyncedItem
+  }
+
+  /** @type {typeof import('./models/KoboSyncedCollection')} */
+  get koboSyncedCollectionModel() {
+    return this.models.koboSyncedCollection
+  }
+
+  /** @type {typeof import('./models/KoboReadingState')} */
+  get koboReadingStateModel() {
+    return this.models.koboReadingState
+  }
+
   /** @type {typeof import('./models/Library')} */
   get libraryModel() {
     return this.models.library
@@ -340,6 +360,10 @@ class Database {
     require('./models/Setting').init(this.sequelize)
     require('./models/CustomMetadataProvider').init(this.sequelize)
     require('./models/MediaItemShare').init(this.sequelize)
+    require('./models/KoboDevice').init(this.sequelize)
+    require('./models/KoboSyncedItem').init(this.sequelize)
+    require('./models/KoboSyncedCollection').init(this.sequelize)
+    require('./models/KoboReadingState').init(this.sequelize)
 
     return this.sequelize.sync({ force, alter: false })
   }

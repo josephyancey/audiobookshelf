@@ -160,6 +160,19 @@ class MiscController {
       return res.status(400).send('allowedOrigins must be an array')
     }
 
+    for (const key of ['koboSyncEnabled', 'koboStoreProxy']) {
+      if (filteredUpdate[key] !== undefined && typeof filteredUpdate[key] !== 'boolean') {
+        return res.status(400).send(`${key} must be a boolean`)
+      }
+    }
+    if (filteredUpdate.koboPublicUrl !== undefined) {
+      const koboPublicUrl = filteredUpdate.koboPublicUrl ? String(filteredUpdate.koboPublicUrl).trim().replace(/\/+$/, '') : null
+      if (koboPublicUrl && !/^https?:\/\/[^\s/]+/i.test(koboPublicUrl)) {
+        return res.status(400).send('koboPublicUrl must start with http:// or https://')
+      }
+      filteredUpdate.koboPublicUrl = koboPublicUrl
+    }
+
     const madeUpdates = Database.serverSettings.update(filteredUpdate)
     if (madeUpdates) {
       await Database.updateServerSettings()

@@ -36,6 +36,7 @@ const MiscController = require('../controllers/MiscController')
 const ShareController = require('../controllers/ShareController')
 const StatsController = require('../controllers/StatsController')
 const ApiKeyController = require('../controllers/ApiKeyController')
+const KoboDeviceController = require('../controllers/KoboDeviceController')
 
 class ApiRouter {
   constructor(Server) {
@@ -185,6 +186,16 @@ class ApiRouter {
     this.router.patch('/me/progress/batch/update', MeController.batchUpdateMediaProgress.bind(this))
     this.router.patch('/me/progress/:libraryItemId/:episodeId?', MeController.createUpdateMediaProgress.bind(this))
     this.router.delete('/me/progress/:id', MeController.removeMediaProgress.bind(this))
+    //
+    // Kobo Device Routes (handlers use their own controller instance)
+    //
+    const koboDevices = (method) => KoboDeviceController[method].bind(KoboDeviceController)
+    this.router.get('/me/kobo-devices', koboDevices('middleware'), koboDevices('findAll'))
+    this.router.post('/me/kobo-devices', koboDevices('middleware'), koboDevices('create'))
+    this.router.patch('/me/kobo-devices/:id', koboDevices('middleware'), koboDevices('update'))
+    this.router.delete('/me/kobo-devices/:id', koboDevices('middleware'), koboDevices('delete'))
+    this.router.post('/me/kobo-devices/:id/token', koboDevices('middleware'), koboDevices('regenerateToken'))
+    this.router.post('/me/kobo-devices/:id/resync', koboDevices('middleware'), koboDevices('resync'))
     this.router.post('/me/item/:id/bookmark', MeController.createBookmark.bind(this))
     this.router.patch('/me/item/:id/bookmark', MeController.updateBookmark.bind(this))
     this.router.delete('/me/item/:id/bookmark/:time', MeController.removeBookmark.bind(this))

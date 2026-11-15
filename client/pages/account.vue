@@ -69,6 +69,64 @@
         </app-settings-content>
       </div>
 
+      <div v-if="showKoboDevices">
+        <div class="w-full h-px bg-white/10 my-4" />
+
+        <app-settings-content :header-text="$strings.HeaderKoboDevices" :description="$strings.MessageKoboDevicesDescription">
+          <template #header-items>
+            <div class="grow" />
+
+            <ui-btn color="bg-primary" small :disabled="loadingKoboDevices" @click="addKoboDeviceClick">{{ $strings.ButtonAddDevice }}</ui-btn>
+          </template>
+
+          <table v-if="koboDevices.length" class="tracksTable mt-4 table-fixed w-full">
+            <tr>
+              <th class="text-left">{{ $strings.LabelName }}</th>
+              <th class="text-left hidden sm:table-cell">{{ $strings.LabelKoboSyncing }}</th>
+              <th class="text-left w-28 sm:w-32">{{ $strings.LabelKoboLastSync }}</th>
+              <th class="w-36 sm:w-40"></th>
+            </tr>
+            <tr v-for="device in koboDevices" :key="device.id">
+              <td class="max-w-0">
+                <p class="text-sm md:text-base text-gray-100 truncate" :title="device.name">{{ device.name }}</p>
+              </td>
+              <td class="hidden sm:table-cell max-w-0">
+                <p class="text-sm text-gray-100 truncate" :title="getKoboLibrariesSummary(device)">{{ getKoboLibrariesSummary(device) }}</p>
+                <p v-if="device.onlyCollections" class="text-xs text-gray-300 truncate">{{ $getString('LabelKoboOnlyCollectionsCount', [(device.collectionIds || []).length]) }}</p>
+              </td>
+              <td class="w-28 sm:w-32">
+                <ui-tooltip v-if="device.lastSyncAt" direction="top" :text="$formatDatetime(device.lastSyncAt, dateFormat, timeFormat)">
+                  <p class="text-xs sm:text-sm text-gray-100">{{ $dateDistanceFromNow(device.lastSyncAt) }}</p>
+                </ui-tooltip>
+                <p v-else class="text-xs sm:text-sm text-gray-400">{{ $strings.LabelKoboNeverSynced }}</p>
+              </td>
+              <td class="w-36 sm:w-40">
+                <div class="flex justify-end items-center h-10">
+                  <ui-tooltip direction="top" :text="$strings.ButtonEdit" class="inline-flex">
+                    <ui-icon-btn icon="edit" borderless :size="8" icon-font-size="1.1rem" :aria-label="$strings.ButtonEdit" :disabled="processingKoboDeviceId === device.id" @click="editKoboDeviceClick(device)" />
+                  </ui-tooltip>
+                  <ui-tooltip direction="top" :text="$strings.ButtonKoboResync" class="inline-flex">
+                    <ui-icon-btn icon="sync" borderless :size="8" icon-font-size="1.1rem" :aria-label="$strings.ButtonKoboResync" :disabled="processingKoboDeviceId === device.id" @click="resyncKoboDeviceClick(device)" />
+                  </ui-tooltip>
+                  <ui-tooltip direction="top" :text="$strings.ButtonKoboNewSetupLine" class="inline-flex">
+                    <ui-icon-btn icon="key" borderless :size="8" icon-font-size="1.1rem" :aria-label="$strings.ButtonKoboNewSetupLine" :disabled="processingKoboDeviceId === device.id" @click="regenerateKoboTokenClick(device)" />
+                  </ui-tooltip>
+                  <ui-tooltip direction="top" :text="$strings.ButtonDelete" class="inline-flex">
+                    <ui-icon-btn icon="delete" borderless :size="8" icon-font-size="1.1rem" :aria-label="$strings.ButtonDelete" :disabled="processingKoboDeviceId === device.id" @click="deleteKoboDeviceClick(device)" />
+                  </ui-tooltip>
+                </div>
+              </td>
+            </tr>
+          </table>
+          <div v-else-if="koboDevicesError" class="text-center py-4">
+            <p class="text-base text-error">{{ koboDevicesError }}</p>
+          </div>
+          <div v-else-if="!loadingKoboDevices" class="text-center py-4">
+            <p class="text-lg text-gray-100">{{ $strings.MessageNoDevices }}</p>
+          </div>
+        </app-settings-content>
+      </div>
+
       <div v-if="!isGuest">
         <div class="w-full h-px bg-white/10 my-4" />
 
@@ -118,6 +176,7 @@
       </div>
 
       <modals-emails-user-e-reader-device-modal v-model="showEReaderDeviceModal" :existing-devices="revisedEreaderDevices" :ereader-device="selectedEReaderDevice" @update="ereaderDevicesUpdated" />
+      <modals-kobo-device-modal v-if="showKoboDevices" v-model="showKoboDeviceModal" :device="selectedKoboDevice" :api-endpoint="koboApiEndpoint" @create="koboDeviceCreated" @update="koboDeviceUpdated" />
     </div>
   </div>
 </template>
@@ -146,7 +205,22 @@ export default {
       ereaderDevices: [],
       deletingDeviceName: null,
       selectedEReaderDevice: null,
-      showEReaderDeviceModal: false
+      showEReaderDeviceModal: false,
+      koboDevices: [],
+      koboDevicesError: null,
+      loadingKoboDevices: false,
+      processingKoboDeviceId: null,
+      selectedKoboDevice: null,
+      koboApiEndpoint: null,
+      showKoboDeviceModal: false
+    }
+  },
+  watch: {
+    showKoboDevices(newVal) {
+      // Server settings can arrive after the page mounts
+      if (newVal && !this.koboDevices.length && !this.loadingKoboDevices) {
+        this.loadKoboDevices()
+      }
     }
   },
   computed: {
@@ -180,6 +254,9 @@ export default {
     },
     revisedEreaderDevices() {
       return this.ereaderDevices.filter((device) => device.users?.length === 1)
+    },
+    showKoboDevices() {
+      return !!this.$store.getters['getServerSetting']('koboSyncEnabled') && this.$store.getters['user/getUserCanDownload']
     },
     dateFormat() {
       return this.$store.getters['getServerSetting']('dateFormat')
@@ -372,6 +449,132 @@ export default {
       if (deviceInfo.osName) parts.push(`${deviceInfo.osName}${deviceInfo.osVersion ? ` ${deviceInfo.osVersion}` : ''}`)
       if (deviceInfo.browserName) parts.push(deviceInfo.browserName)
       return parts.join(' / ') || session.userAgent || '-'
+    },
+    getRequestErrorMessage(error, fallback) {
+      if (error.response?.data && typeof error.response.data === 'string') {
+        return error.response.data
+      }
+      return fallback
+    },
+    loadKoboDevices() {
+      this.loadingKoboDevices = true
+      this.koboDevicesError = null
+      this.$axios
+        .$get('/api/me/kobo-devices')
+        .then((data) => {
+          this.koboDevices = data.devices || []
+        })
+        .catch((error) => {
+          console.error('Failed to load Kobo devices', error)
+          this.koboDevicesError = this.getRequestErrorMessage(error, this.$strings.ToastKoboDevicesLoadFailed)
+        })
+        .finally(() => {
+          this.loadingKoboDevices = false
+        })
+    },
+    getKoboLibrariesSummary(device) {
+      if (!device.libraryIds?.length) return this.$strings.LabelKoboAllLibraries
+      const libraries = this.$store.state.libraries.libraries || []
+      return (
+        device.libraryIds
+          .map((id) => libraries.find((lib) => lib.id === id)?.name)
+          .filter(Boolean)
+          .join(', ') || '-'
+      )
+    },
+    addKoboDeviceClick() {
+      this.selectedKoboDevice = null
+      this.koboApiEndpoint = null
+      this.showKoboDeviceModal = true
+    },
+    editKoboDeviceClick(device) {
+      this.selectedKoboDevice = device
+      this.koboApiEndpoint = null
+      this.showKoboDeviceModal = true
+    },
+    koboDeviceCreated(device) {
+      if (!device) return
+      this.koboDevices.push(device)
+      this.koboDevicesError = null
+    },
+    koboDeviceUpdated(device) {
+      if (!device) return
+      const index = this.koboDevices.findIndex((d) => d.id === device.id)
+      if (index >= 0) this.koboDevices.splice(index, 1, device)
+    },
+    resyncKoboDeviceClick(device) {
+      this.$store.commit('globals/setConfirmPrompt', {
+        message: this.$getString('MessageConfirmKoboResync', [device.name]),
+        callback: (confirmed) => {
+          if (confirmed) this.resyncKoboDevice(device)
+        },
+        type: 'yesNo'
+      })
+    },
+    resyncKoboDevice(device) {
+      this.processingKoboDeviceId = device.id
+      this.$axios
+        .$post(`/api/me/kobo-devices/${device.id}/resync`)
+        .then(() => {
+          this.$toast.success(this.$strings.ToastKoboResyncQueued)
+        })
+        .catch((error) => {
+          console.error('Failed to resync Kobo device', error)
+          this.$toast.error(this.getRequestErrorMessage(error, this.$strings.ToastFailedToUpdate))
+        })
+        .finally(() => {
+          this.processingKoboDeviceId = null
+        })
+    },
+    regenerateKoboTokenClick(device) {
+      this.$store.commit('globals/setConfirmPrompt', {
+        message: this.$getString('MessageConfirmKoboNewSetupLine', [device.name]),
+        callback: (confirmed) => {
+          if (confirmed) this.regenerateKoboToken(device)
+        },
+        type: 'yesNo'
+      })
+    },
+    regenerateKoboToken(device) {
+      this.processingKoboDeviceId = device.id
+      this.$axios
+        .$post(`/api/me/kobo-devices/${device.id}/token`)
+        .then((data) => {
+          this.selectedKoboDevice = device
+          this.koboApiEndpoint = data.apiEndpoint
+          this.showKoboDeviceModal = true
+        })
+        .catch((error) => {
+          console.error('Failed to regenerate Kobo token', error)
+          this.$toast.error(this.getRequestErrorMessage(error, this.$strings.ToastFailedToUpdate))
+        })
+        .finally(() => {
+          this.processingKoboDeviceId = null
+        })
+    },
+    deleteKoboDeviceClick(device) {
+      this.$store.commit('globals/setConfirmPrompt', {
+        message: this.$getString('MessageConfirmDeleteKoboDevice', [device.name]),
+        callback: (confirmed) => {
+          if (confirmed) this.deleteKoboDevice(device)
+        },
+        type: 'yesNo'
+      })
+    },
+    deleteKoboDevice(device) {
+      this.processingKoboDeviceId = device.id
+      this.$axios
+        .$delete(`/api/me/kobo-devices/${device.id}`)
+        .then(() => {
+          this.koboDevices = this.koboDevices.filter((d) => d.id !== device.id)
+        })
+        .catch((error) => {
+          console.error('Failed to delete Kobo device', error)
+          this.$toast.error(this.getRequestErrorMessage(error, this.$strings.ToastFailedToDelete))
+        })
+        .finally(() => {
+          this.processingKoboDeviceId = null
+        })
     }
   },
   mounted() {
@@ -379,6 +582,9 @@ export default {
     this.ereaderDevices = this.$store.state.libraries.ereaderDevices || []
     if (!this.isGuest) {
       this.loadAuthSessions()
+    }
+    if (this.showKoboDevices) {
+      this.loadKoboDevices()
     }
   }
 }

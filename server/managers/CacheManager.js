@@ -17,6 +17,7 @@ class CacheManager {
     this.CoverCachePath = null
     this.ImageCachePath = null
     this.ItemCachePath = null
+    this.KepubCachePath = null
   }
 
   /**
@@ -28,12 +29,14 @@ class CacheManager {
     this.CoverCachePath = Path.join(this.CachePath, 'covers')
     this.ImageCachePath = Path.join(this.CachePath, 'images')
     this.ItemCachePath = Path.join(this.CachePath, 'items')
+    this.KepubCachePath = Path.join(this.CachePath, 'kepub')
 
     try {
       await fs.ensureDir(this.CachePath)
       await fs.ensureDir(this.CoverCachePath)
       await fs.ensureDir(this.ImageCachePath)
       await fs.ensureDir(this.ItemCachePath)
+      await fs.ensureDir(this.KepubCachePath)
     } catch (error) {
       Logger.error(`[CacheManager] Failed to create cache directories at "${this.CachePath}": ${error.message}`)
       throw new Error(`[CacheManager] Failed to create cache directories at "${this.CachePath}"`, { cause: error })

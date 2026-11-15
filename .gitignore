@@ -19,6 +19,7 @@
 /ffprobe*
 /unicode*
 /libnusqlite3*
+/kepubify*
 
 sw.*
 .DS_STORE

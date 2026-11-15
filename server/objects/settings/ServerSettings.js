@@ -25,7 +25,10 @@ const PATCHABLE_SETTINGS_KEYS = new Set([
   'timeFormat',
   'language',
   'chromecastEnabled',
-  'sortingIgnorePrefix'
+  'sortingIgnorePrefix',
+  'koboSyncEnabled',
+  'koboStoreProxy',
+  'koboPublicUrl'
 ])
 
 class ServerSettings {
@@ -51,6 +54,13 @@ class ServerSettings {
     this.rateLimitLoginRequests = 10
     this.rateLimitLoginWindow = 10 * 60 * 1000 // 10 Minutes
     this.allowIframe = false
+
+    // Kobo sync
+    this.koboSyncEnabled = false
+    /** @type {boolean} Forward requests the server does not answer to the Kobo store */
+    this.koboStoreProxy = true
+    /** @type {string|null} Address Kobo devices use to reach this server, overrides the request host */
+    this.koboPublicUrl = null
 
     // Backups
     this.backupPath = Path.join(global.MetadataPath, 'backups')
@@ -128,6 +138,10 @@ class ServerSettings {
     this.rateLimitLoginRequests = !isNaN(settings.rateLimitLoginRequests) ? Number(settings.rateLimitLoginRequests) : 10
     this.rateLimitLoginWindow = !isNaN(settings.rateLimitLoginWindow) ? Number(settings.rateLimitLoginWindow) : 10 * 60 * 1000 // 10 Minutes
     this.allowIframe = !!settings.allowIframe
+
+    this.koboSyncEnabled = !!settings.koboSyncEnabled
+    this.koboStoreProxy = settings.koboStoreProxy !== false
+    this.koboPublicUrl = settings.koboPublicUrl || null
 
     this.backupPath = settings.backupPath || Path.join(global.MetadataPath, 'backups')
     this.backupSchedule = settings.backupSchedule || false
@@ -243,6 +257,9 @@ class ServerSettings {
       rateLimitLoginRequests: this.rateLimitLoginRequests,
       rateLimitLoginWindow: this.rateLimitLoginWindow,
       allowIframe: this.allowIframe,
+      koboSyncEnabled: this.koboSyncEnabled,
+      koboStoreProxy: this.koboStoreProxy,
+      koboPublicUrl: this.koboPublicUrl,
       backupPath: this.backupPath,
       backupSchedule: this.backupSchedule,
       backupsToKeep: this.backupsToKeep,

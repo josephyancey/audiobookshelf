@@ -25,6 +25,8 @@ const SocketAuthority = require('./SocketAuthority')
 const ApiRouter = require('./routers/ApiRouter')
 const HlsRouter = require('./routers/HlsRouter')
 const PublicRouter = require('./routers/PublicRouter')
+const KoboRouter = require('./routers/KoboRouter')
+const KoboController = require('./controllers/KoboController')
 
 const LogManager = require('./managers/LogManager')
 const EmailManager = require('./managers/EmailManager')
@@ -142,6 +144,7 @@ class Server {
     this.apiRouter = new ApiRouter(this)
     this.hlsRouter = new HlsRouter(this.auth, this.playbackSessionManager)
     this.publicRouter = new PublicRouter(this.playbackSessionManager)
+    this.koboRouter = new KoboRouter()
 
     Logger.logManager = new LogManager()
 
@@ -342,9 +345,12 @@ class Server {
     // Skip JSON parsing for internal-api routes
     router.use(/^(?!\/internal-api).*/, express.json({ limit: '10mb' }))
 
+    // Kobo reading services hit the site root, ahead of the /api auth (design §10)
+    router.use(KoboController.readingServicesStub.bind(KoboController))
     router.use('/api', this.auth.ifAuthNeeded(this.authMiddleware.bind(this)), this.apiRouter.router)
     router.use('/hls', this.hlsRouter.router)
     router.use('/public', this.publicRouter.router)
+    router.use('/kobo/:token', this.koboRouter.router)
 
     // Static folder
     router.use(express.static(Path.join(global.appRoot, 'static')))
